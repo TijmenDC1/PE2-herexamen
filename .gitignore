@@ -1,0 +1,27 @@
+# Build output
+Debug/
+Release/
+build/
+
+# STM32CubeIDE workspace bestanden
+.metadata/
+.settings/
+RemoteSystemsTempFiles/
+
+# Object en binary bestanden
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.d
+*.su
+
+# Logs
+*.log
+
+# OS specifieke bestanden
+.DS_Store
+Thumbs.db
