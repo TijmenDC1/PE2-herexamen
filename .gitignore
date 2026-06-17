@@ -25,3 +25,29 @@ RemoteSystemsTempFiles/
 # OS specifieke bestanden
 .DS_Store
 Thumbs.db
+
+# ---- Altium Designer ----
+# Backup en tijdelijke bestanden
+*.~*
+*.bak
+*.PcbDoc.bak
+*.SchDoc.bak
+
+# Lock-bestanden (ontstaan terwijl iemand het bestand open heeft)
+*.Lck
+*.PcbDoc.Lck
+*.SchDoc.Lck
+*.PrjPcb.Lck
+
+# Logs en outputs gegenereerd door Altium
+History/
+__Previews/
+Project Logs for*/
+Project Outputs for*/
+*.OutJob
+
+# Overige gegenereerde/structuur bestanden
+*.PrjPcbStructure
+*.PriorSearch
+*.DdbLck
+DraftsmanDocument.*
