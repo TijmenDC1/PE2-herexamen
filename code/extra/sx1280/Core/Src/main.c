@@ -25,6 +25,7 @@
 //#include "BMI330.h"
 #include "stdio.h"
 #include "sx1280include.h"
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,7 +35,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define FHSS_SEQUENCE_LEN 256  // ELRS standaard sequence lengte
+#define FREQ_COUNT 80          // Aantal kanalen in ISM2400 band
+#define SYNC_CHANNEL 40        // Midden van de band (80 / 2)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,9 +56,9 @@ SPI_HandleTypeDef hspi2;
 SPI_HandleTypeDef hspi4;
 
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 DMA_HandleTypeDef hdma_tim2_up_ch3;
-DMA_HandleTypeDef hdma_tim2_ch1;
 DMA_HandleTypeDef hdma_tim4_ch1;
 DMA_HandleTypeDef hdma_tim4_ch2;
 
@@ -68,15 +71,6 @@ PID_Handle_t struct_PidRateRoll;
 PID_Handle_t struct_PidRatePitch;
 PID_Handle_t struct_PidRateYaw;
 */
-int _write(int file, char *ptr, int len) {
-	for(int i = 0; i < len; i++){
-		if(ptr[i]=='\n'){
-			HAL_UART_Transmit(&huart8, (uint8_t*)"\r", 1, HAL_MAX_DELAY);
-		}
-		HAL_UART_Transmit(&huart8, (uint8_t*)&ptr[i], 1, HAL_MAX_DELAY);
-	}
-    return len;
-}
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -93,14 +87,80 @@ static void MX_TIM2_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_UART7_Init(void);
 static void MX_UART8_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+int _write(int file, char *ptr, int len) {
+	for(int i = 0; i < len; i++){
+		if(ptr[i]=='\n'){
+			HAL_UART_Transmit(&huart8, (uint8_t*)"\r", 1, HAL_MAX_DELAY);
+		}
+		HAL_UART_Transmit(&huart8, (uint8_t*)&ptr[i], 1, HAL_MAX_DELAY);
+	}
+    return len;
+}
+
 volatile uint8_t rx_packet_flag = 0;
 int new_gyro_data_available = 0;
+
+volatile uint8_t fhss_index = 0;
+volatile uint8_t is_synchronized = 0;
+uint32_t fhss_seed;
+uint8_t fhss_sequence[FHSS_SEQUENCE_LEN];
+
+// --- PRNG Functies (gebaseerd op ELRS random.cpp) ---
+void rngSeed(uint32_t seed) {
+    fhss_seed = seed;
+}
+
+uint32_t rng32(void) {
+    fhss_seed ^= fhss_seed << 13;
+    fhss_seed ^= fhss_seed >> 17;
+    fhss_seed ^= fhss_seed << 5;
+    return fhss_seed;
+}
+
+// Genereert random getal van 0 tot (max - 1)
+uint32_t rngN(uint32_t max) {
+    return ((uint64_t)rng32() * max) >> 32;
+}
+
+// --- De exacte FHSS bouwer uit jouw bestand ---
+void FHSS_GenerateSequence(void) {
+    // Jouw specifieke seed (laatste 4 bytes van UID: 163, 59, 219, 118, 199, 162)
+    uint32_t my_seed = (219 << 24) | (118 << 16) | (199 << 8) | 162;
+    rngSeed(my_seed);
+
+    // 1. Array initialiseren in blokken van 80
+    for (uint16_t i = 0; i < FHSS_SEQUENCE_LEN; i++) {
+        if (i % FREQ_COUNT == 0) {
+            fhss_sequence[i] = SYNC_CHANNEL; // Zet kanaal 40 altijd vooraan het blok
+        } else if (i % FREQ_COUNT == SYNC_CHANNEL) {
+            fhss_sequence[i] = 0;
+        } else {
+            fhss_sequence[i] = i % FREQ_COUNT;
+        }
+    }
+
+    // 2. Array shufflen, maar het Sync Kanaal negeren!
+    for (uint16_t i = 0; i < FHSS_SEQUENCE_LEN; i++) {
+        // Als het NIET het sync kanaal is (dus niet index 0, 80, 160, 240)
+        if (i % FREQ_COUNT != 0) {
+            uint8_t offset = (i / FREQ_COUNT) * FREQ_COUNT;  // Bereken begin van huidige blok
+            uint8_t rand = rngN(FREQ_COUNT - 1) + 1;         // Random offset tussen 1 en 79
+
+            // Wissel dit element met een ander random element in hetzelfde blok
+            uint8_t temp = fhss_sequence[i];
+            fhss_sequence[i] = fhss_sequence[offset + rand];
+            fhss_sequence[offset + rand] = temp;
+        }
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -122,7 +182,6 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   //Init_RateLoops();
   //BMM350_Init();
   //BMP384_Init();
@@ -153,42 +212,69 @@ int main(void)
   MX_UART7_Init();
   MX_FATFS_Init();
   MX_UART8_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-    uint8_t is_sx1280_working = SX1280_TestConnection();
+  HAL_TIM_Base_Start_IT(&htim3);
+  HAL_Delay(5000);
+  uint8_t is_sx1280_working = SX1280_TestConnection();
+  while(is_sx1280_working == 0){
     if(is_sx1280_working == 0){
         printf("Er is een fout\n");
-        while(1);
+        //while(1);
     }
+    HAL_Delay(100);
+    is_sx1280_working = SX1280_TestConnection();
+  }
+  	printf("Het werkt\n");
 
+//HAL_Delay(5000);
     SX1280_Setup_Sniper();
 
+    FHSS_GenerateSequence();
+	for(int i = 0; i < 80; i++){
+		printf("%d, ",  fhss_sequence[i]);
+	}
+	printf("\n");
+
       // zendvermogen, rampup time: 13 dBm, 20us
-      SX1280_SetTxParams(0x1F, 0xE0);
+      //SX1280_SetTxParams(0x1F, 0xE0);
 
       //uint32_t last_send_time = 0;
       //uint8_t test_payload[] = {0x48, 0x65, 0x6C, 0x6C, 0x6F}; // "Hello"
-      SX1280_SetTxContinuousWave();
-    /* USER CODE END 2 */
+      //SX1280_SetTxContinuousWave();
 
-    /* USER CODE BEGIN WHILE */
-    while (1)
-    {
-    	/*
-        if (rx_packet_flag == 1)
-        {
-            rx_packet_flag = 0;
-            SX1280_OnPacketReceived();
-        }
+  /* USER CODE END 2 */
 
-        int8_t rssi = SX1280_GetRssiInst();
-        printf("RSSI: %d dBm\n", rssi);
-        HAL_Delay(5);
-    }
-    */
-    	HAL_Delay(1000);
-    	      printf("Zendt continu op 2.4 GHz...\n");
-    }
-    /* USER CODE END 3 */
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+	  // 1. Polling: Vraag via SPI of het RxDone bitje is gezet
+	          if (SX1280_CheckRxDonePolling() == 1)
+	          {
+	              printf("[MAIN] Pakket gevonden via POLLING! Data verwerken...\n");
+
+	              // Deze functie leest de data, wist de IRQ vlag en start RX opnieuw
+	              SX1280_OnPacketReceived();
+	          }
+
+	          // 2. Heartbeat: Zodat we weten dat de loop niet is vastgelopen
+	          static uint32_t last_heartbeat = 0;
+	          if ((HAL_GetTick() - last_heartbeat) > 2000)
+	          {
+	              last_heartbeat = HAL_GetTick();
+	              printf("Aan het luisteren op 2.4404 GHz (Sync Kanaal)...\n");
+	              int8_t waardedb = SX1280_GetRssiInst();
+	              printf("db waarde: %d\n", waardedb);
+	          }
+
+	          // Een heel klein beetje ademruimte voor de loop (voorkomt dat de SPI bus continu wordt gespamd)
+	          HAL_Delay(1);
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
 }
 
 /**
@@ -203,19 +289,20 @@ void SystemClock_Config(void)
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 8;
-  RCC_OscInitStruct.PLL.PLLN = 50;
+  RCC_OscInitStruct.PLL.PLLN = 216;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 9;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -234,10 +321,10 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK)
   {
     Error_Handler();
   }
@@ -259,7 +346,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00401959;
+  hi2c1.Init.Timing = 0x6000030D;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -477,10 +564,6 @@ static void MX_TIM2_Init(void)
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
@@ -489,6 +572,51 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 107;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 19999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
 
 }
 
@@ -604,7 +732,8 @@ static void MX_UART8_Init(void)
   huart8.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart8.Init.OverSampling = UART_OVERSAMPLING_16;
   huart8.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart8.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  huart8.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT;
+  huart8.AdvancedInit.Swap = UART_ADVFEATURE_SWAP_ENABLE;
   if (HAL_UART_Init(&huart8) != HAL_OK)
   {
     Error_Handler();
@@ -634,9 +763,6 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream3_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
-  /* DMA1_Stream5_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
 
 }
 
@@ -664,7 +790,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(BMP_CS_GPIO_Port, BMP_CS_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(BMI_CS_GPIO_Port, BMI_CS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, DshotM1WDA_Pin|BMI_CS_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(SX1280_CS_GPIO_Port, SX1280_CS_Pin, GPIO_PIN_SET);
@@ -691,18 +817,18 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : DshotM1WDA_Pin BMI_CS_Pin */
+  GPIO_InitStruct.Pin = DshotM1WDA_Pin|BMI_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pins : Overcurrent_M1_Pin Overcurrent_M2_Pin */
   GPIO_InitStruct.Pin = Overcurrent_M1_Pin|Overcurrent_M2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : BMI_CS_Pin */
-  GPIO_InitStruct.Pin = BMI_CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(BMI_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : GPS_Timer_Pin SD_SWA_Pin */
   GPIO_InitStruct.Pin = GPS_Timer_Pin|SD_SWA_Pin;
@@ -736,12 +862,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : SX1280_INT_Pin */
-  GPIO_InitStruct.Pin = SX1280_INT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(SX1280_INT_GPIO_Port, &GPIO_InitStruct);
-
   /*Configure GPIO pin : BMM_INT_Pin */
   GPIO_InitStruct.Pin = BMM_INT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
@@ -764,7 +884,29 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM3 && is_synchronized == 1)
+    {
+        // 1. Ga naar het volgende kanaal in de array
+        fhss_index++;
+        if (fhss_index >= 80) { // FREQ_COUNT
+            fhss_index = 0;
+        }
 
+        // 2. Bereken de nieuwe frequentie
+        // ELRS basis is 2400.4 MHz (2400400000 Hz) + (kanaal * 1 MHz)
+        uint32_t nieuwe_frequentie = 2400400000 + (fhss_sequence[fhss_index] * 1000000);
+
+        // 3. Stuur commando's naar de SX1280 (Snel!)
+        SX1280_SetRfFrequency(nieuwe_frequentie);
+        SX1280_SetRx();
+
+        // Let op: Printfs in een interrupt zijn gevaarlijk traag,
+        // maar voor nu even handig om te zien of hij hopt!
+        // printf("Gehopt naar index %d (Kanaal %d)\n", fhss_index, fhss_sequence[fhss_index]);
+    }
+}
 /*
 void Update_Motors(uint16_t throttle, int16_t roll, int16_t pitch, int16_t yaw) {
     int16_t m1 = throttle + pitch + roll - yaw; // Linksvoor

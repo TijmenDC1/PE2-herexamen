@@ -87,5 +87,6 @@ void zeroingAnArray(uint8_t arrayToZero[], uint16_t arrayLength);
 void SX1280_WriteBufferArray(uint8_t offset, uint8_t *data, uint8_t size);
 void SX1280_SetTxParams(int8_t power, uint8_t rampTime);
 void SX1280_SetTxContinuousWave(void);
+uint8_t SX1280_CheckRxDonePolling(void);
 
 #endif /* INC_SX1280INCLUDE_H_ */

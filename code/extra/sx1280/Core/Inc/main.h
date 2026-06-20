@@ -72,8 +72,8 @@ void Error_Handler(void);
 #define BMP_INT_Pin GPIO_PIN_13
 #define BMP_INT_GPIO_Port GPIOC
 #define BMP_INT_EXTI_IRQn EXTI15_10_IRQn
-#define Dshot_M1_Pin GPIO_PIN_0
-#define Dshot_M1_GPIO_Port GPIOA
+#define DshotM1WDA_Pin GPIO_PIN_0
+#define DshotM1WDA_GPIO_Port GPIOA
 #define Overcurrent_M1_Pin GPIO_PIN_1
 #define Overcurrent_M1_GPIO_Port GPIOA
 #define Dshot_M2_Pin GPIO_PIN_2
@@ -120,9 +120,6 @@ void Error_Handler(void);
 #define Dshot_M4_GPIO_Port GPIOD
 #define Dshot_M3_Pin GPIO_PIN_13
 #define Dshot_M3_GPIO_Port GPIOD
-#define SX1280_INT_Pin GPIO_PIN_15
-#define SX1280_INT_GPIO_Port GPIOD
-#define SX1280_INT_EXTI_IRQn EXTI15_10_IRQn
 #define SD_D0_Pin GPIO_PIN_8
 #define SD_D0_GPIO_Port GPIOC
 #define SD_D1_Pin GPIO_PIN_9
@@ -148,10 +145,6 @@ void Error_Handler(void);
 #define BMM_SCL_GPIO_Port GPIOB
 #define BMM_SDA_Pin GPIO_PIN_9
 #define BMM_SDA_GPIO_Port GPIOB
-#define STLink_RX_Pin GPIO_PIN_0
-#define STLink_RX_GPIO_Port GPIOE
-#define STLink_TX_Pin GPIO_PIN_1
-#define STLink_TX_GPIO_Port GPIOE
 
 /* USER CODE BEGIN Private defines */
 

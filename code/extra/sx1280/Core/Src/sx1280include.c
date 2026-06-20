@@ -9,7 +9,7 @@ uint8_t SX1280_BUSY(void)
 {
     uint32_t start_time = HAL_GetTick(); // Gebruik uint32_t voor HAL_GetTick!
 
-    if(HAL_GPIO_ReadPin(SX1280_Bussy_GPIO_Port, SX1280_Bussy_Pin) == GPIO_PIN_SET && 1){
+    if(HAL_GPIO_ReadPin(SX1280_Bussy_GPIO_Port, SX1280_Bussy_Pin) == GPIO_PIN_SET){
     	printf("Busy after reset: %lu\n", start_time);
     }
 
@@ -20,7 +20,7 @@ uint8_t SX1280_BUSY(void)
             return 1; // 1 betekent: Timeout / Fout!
         }
     }
-    printf("Busy for: %lu\n", (HAL_GetTick() - start_time));
+    //printf("Busy for: %lu\n", (HAL_GetTick() - start_time));
     return 0; // 0 betekent: Alles is oké, chip is klaar (BUSY is laag).
 }
 
@@ -68,7 +68,7 @@ void SX1280_getstatus(void)
     uint8_t cmd[2] = {0xC0,01}; //00= intern RC 01 = xosc
     uint8_t receive[2];
     SX1280_Select();
-    HAL_SPI_TransmitReceive(&hspi2, cmd, receive, 1, HAL_MAX_DELAY);//(&hspi2, cmd, 2, HAL_MAX_DELAY);
+    HAL_SPI_TransmitReceive(&hspi2, cmd, receive, 2, HAL_MAX_DELAY);//(&hspi2, cmd, 2, HAL_MAX_DELAY);
     printf("Status = %02x\n", receive[0]);
     SX1280_Deselect();
 }
@@ -289,7 +289,7 @@ void SX1280_SetDioIrqParams()
 }
 void SX1280_Setup_Sniper(void)
 {
-    printf("\n--- Start ELRS 50Hz Sniper Setup ---\n");
+    printf("\n--- Start ELRS 50Hz Sync-Sniper Setup ---\n");
 
     uint8_t buf[10];
 
@@ -320,8 +320,9 @@ void SX1280_Setup_Sniper(void)
     SX1280_Deselect();
     SX1280_BUSY();
 
-    // Frequentie: 2.404 GHz
-    SX1280_SetRfFrequency(2404000000);
+    // *** DIT IS DE BELANGRIJKSTE AANPASSING ***
+    // Frequentie: 2.4404 GHz (Kanaal 40 in de ELRS ISM2400 band)
+    SX1280_SetRfFrequency(2440400000);
 
     // standaard startadres 0x00 maar voor zekerheid nog eens zetten
     buf[0] = SX1280_SETBUFFER_BASEADDRESS;
@@ -332,26 +333,29 @@ void SX1280_Setup_Sniper(void)
     SX1280_Deselect();
     SX1280_BUSY();
 
-    // Modulatie (LoRa, SF7, BW 800kHz, CR 4/5)
+    // Modulatie (LoRa, SF7, BW 800kHz, CR 4/5) - Dit komt overeen met ELRS 50Hz
     buf[0] = SX1280_SETMODULATIONPARAMS;
-    buf[1] = 0x60;
+    buf[1] = 0x80;
     buf[2] = 0x18;
-    buf[3] = 0x01;
+    buf[3] = 0x07;
     SX1280_Select();
     HAL_SPI_Transmit(&hspi2, buf, 4, HAL_MAX_DELAY);
     SX1280_Deselect();
     SX1280_BUSY();
+
+    // Optioneel: status checken
     SX1280_PrintStatus("Na ModParams");
-    SX1280_BUSY();
-    SX1280_WriteRegister(0x925, 0x1E); // verplicht voor SF5/SF6 na setmodulation
+
+    // Fixes voor de chip (verplicht na setmodulation)
+    SX1280_WriteRegister(0x925, 0x1E);
     SX1280_WriteRegister(0x93C, 0x01);
 
     // Packet Params (Preamble 12, CRC OFF, Standaard IQ)
     buf[0] = SX1280_SET_PACKET_PARAMS;
     buf[1] = 12;
-    buf[2] = 0x00;
-    buf[3] = 0x1A;
-    buf[4] = 0x20;
+    buf[2] = 0x80;  // Fixed/Implicit header
+    buf[3] = 8;     // payload length, moet matchen met je payload[8] buffer
+    buf[4] = 0x00;  // CRC OFF
     buf[5] = 0x00;
     SX1280_Select();
     HAL_SPI_Transmit(&hspi2, buf, 6, HAL_MAX_DELAY);
@@ -359,57 +363,52 @@ void SX1280_Setup_Sniper(void)
     SX1280_BUSY();
     SX1280_PrintStatus("Na PacketParams");
 
-    // 9. Interrupts en RX starten
+    // Interrupts instellen op RxDone en RX starten
     SX1280_SetDioIrqParams();
     SX1280_SetRx();
     SX1280_PrintStatus("Na SetRx\n");
-    printf("Volledige Setup klaar. Luisteren gestart...\n\n");
+
+    printf("Volledige Setup klaar. Luisteren gestart op 2.4404 GHz (Sync Kanaal)...\n\n");
 }
 
 void SX1280_OnPacketReceived(void)
 {
-    uint8_t payload[8] = {0};
-
-    // 1. Waar staat de data in het geheugen van de SX1280?
-    /*
-    buf[0] = SX1280_GETRXBUFFERSTATUS;
-    SX1280_Select();
-    HAL_SPI_TransmitReceive(&hspi2, buf, status, 3, HAL_MAX_DELAY); // status[1] = length, status[2] = offset
-    SX1280_Deselect();
-    */
+    // 1. Vraag buffer status op (4 bytes: Opcode -> NOP -> NOP -> NOP)
     uint8_t buf[4] = {SX1280_GETRXBUFFERSTATUS, 0x00, 0x00, 0x00};
     uint8_t status[4] = {0};
+
     SX1280_BUSY();
     SX1280_Select();
     HAL_SPI_TransmitReceive(&hspi2, buf, status, 4, HAL_MAX_DELAY);
     SX1280_Deselect();
+
+    // Bij een 4-byte transfer zit de data hier:
     uint8_t length = status[2]; // rxPayloadLength
     uint8_t offset = status[3]; // rxStartBufferPointer
 
-    //uint8_t length = status[1];
-    //uint8_t offset = status[2];
+    printf("RX Status - Lengte gerapporteerd: %d, Offset: %d\n", length, offset);
 
-    // 2. Lees de daadwerkelijke bytes uit de buffer!
-    if (length > 0 && length <= 8) {
-        SX1280_ReadBuffer(offset, payload, length);
+    // 2. Veilig de data lezen
+    uint8_t read_len = (length > 0) ? length : 8;
 
-        // Print de ruwe data (Hier ga je waarschijnlijk delen van je UID: 0x59, 0x3E, 0xA9 in terugzien)
-        printf("PAKKET GESNIPED! Data: ");
-        for(int i=0; i<length; i++) {
-            printf("%02X ", payload[i]);
-        }
-        printf("\n");
+    // Voorkom crashes! Maximaal 255 bytes (SX1280 buffer max)
+    uint8_t payload[255] = {0};
+
+    SX1280_ReadBuffer(offset, payload, read_len);
+
+    printf("PAKKET GESNIPED! Data: ");
+    for(int i = 0; i < read_len; i++) {
+        printf("%02X ", payload[i]);
     }
+    printf("\n");
 
-    // 3. Wis de RxDone Interrupt Flag in de SX1280 (anders blijft DIO2 hoog)
-    buf[0] = SX1280_CLRIRQSTATUS;
-    buf[1] = 0xFF; // Wis alle flags
-    buf[2] = 0xFF;
+    // 3. Wis de RxDone Interrupt Flag
+    uint8_t clr_buf[3] = {SX1280_CLRIRQSTATUS, 0xFF, 0xFF};
     SX1280_Select();
-    HAL_SPI_Transmit(&hspi2, buf, 3, HAL_MAX_DELAY);
+    HAL_SPI_Transmit(&hspi2, clr_buf, 3, HAL_MAX_DELAY);
     SX1280_Deselect();
 
-    // 4. Zet radio weer terug op ontvangen voor het volgende pakketje
+    // 4. Zet radio weer terug op ontvangen
     SX1280_SetRx();
 }
 
@@ -423,15 +422,13 @@ void zeroingAnArray( uint8_t arrayToZero[], uint16_t arrayLength ){
 uint8_t SX1280_TestConnection(void)
 {
     printf("\n--- TEST ---\n");
-
     SX1280_Reset();
-    HAL_Delay(10);
+    HAL_Delay(50);
     uint8_t test_val = 0x45;
     uint8_t test_offset = 0x00;
     // schrijven naar buffer: Opcode (0x1A) -> Offset -> Data
     uint8_t tx_write[3] = {SX1280_WRITEBUFFER, test_offset, test_val};
     uint8_t rx_write[3] = {0};
-
     if (SX1280_BUSY() == 1) {
         printf("Fout: chip blijft bussy\n");
         return 0;
@@ -561,4 +558,36 @@ void SX1280_SetTxContinuousWave(void)
     SX1280_Deselect();
 
     printf("Waarschuwing: SX1280 zendt nu een continue draaggolf (CW) uit!\n");
+}
+uint8_t SX1280_CheckRxDonePolling(void)
+{
+    // 4 bytes: Opcode -> NOP -> NOP -> NOP
+    uint8_t tx_buf[4] = {SX1280_GETIRQSTATUS, 0x00, 0x00, 0x00};
+    uint8_t rx_buf[4] = {0};
+
+    if (SX1280_BUSY() == 1) return 0;
+
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_buf, rx_buf, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    // rx_buf[0] = Status Byte
+    // rx_buf[1] = Status Byte (herhaling)
+    // rx_buf[2] = IRQ bits 15-8 (MSB)
+    // rx_buf[3] = IRQ bits 7-0 (LSB)
+
+    uint16_t irq_status = (rx_buf[2] << 8) | rx_buf[3];
+
+    if (irq_status != 0) {
+        printf("IRQ STATUS GETRIGGERD: 0x%04X\n", irq_status);
+
+        // Wis de flags direct
+        uint8_t clrIrq[3] = {SX1280_CLRIRQSTATUS, 0xFF, 0xFF};
+        SX1280_Select();
+        HAL_SPI_Transmit(&hspi2, clrIrq, 3, HAL_MAX_DELAY);
+        SX1280_Deselect();
+    }
+
+    if ((irq_status & 0x0002) != 0) return 1; // RxDone is bit 1
+    return 0;
 }
