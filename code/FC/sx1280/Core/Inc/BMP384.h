@@ -44,7 +44,7 @@
 #define	BMP384_NVM_PAR_T1_LSB	0x31
 #define	BMP384_NVM_PAR_T1_MSB	0x32
 #define	BMP384_NVM_PAR_T2_LSB	0x33
-#define	BMP384_NVM_PAR_T2_LSB	0x34
+#define	BMP384_NVM_PAR_T2_MSB	0x34
 #define	BMP384_NVM_PAR_T3_MSB	0x35
 #define	BMP384_NVM_PAR_P1_LSB	0x36
 #define	BMP384_NVM_PAR_P1_MSB	0x37
@@ -71,12 +71,11 @@ typedef struct {
 } BMP384_Calib;
 
 HAL_StatusTypeDef BMP384_Init(void);
-static void BMP384_WriteReg(uint8_t reg, uint8_t val);
-static void BMP384_ReadReg(uint8_t reg, uint8_t *pData, uint16_t len);
-float BMP384_ReadData(float *pressure_pa);
-static void BMP384_ReadCalibration(void);
-static float BMP384_Compensate_Pressure(uint32_t uncomp_p, float t_lin);
-uint8_t BMP384_IsDataReady();
+float BMP384_ReadData(void);
+uint8_t BMP384_IsDataReady(void);
 float BMP384_CalculateAltitude(float pressure_pa);
+float BMP384_GetTemp(void);
+void BMP384_ReadCalibration(void);
+void BMP384_ground(void);
 
 #endif

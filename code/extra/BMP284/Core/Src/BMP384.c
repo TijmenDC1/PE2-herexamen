@@ -1,3 +1,4 @@
+// hier ben ik
 /*
  * BMP384.c
  *
@@ -95,7 +96,7 @@ HAL_StatusTypeDef BMP384_Init(BMP384_Calib *calibData){
 	BMP384_WriteReg(BMP384_OSR, 3);							// Oversampling Pressure, zet op x8 voor hoge resolutie
 	BMP384_WriteReg(BMP384_CONFIG, 4);						// Zet de iir filter cooficient op 3
 	BMP384_WriteReg(BMP384_ODR, 2);
-	BMP384_WriteReg(BMP384_INT_CTRL	, 0x46);				// we stellen in hoe de INT pin moet werken en dat het een INT stuurd wnr de data klaar is
+	BMP384_WriteReg(BMP384_INT_CTRL	, 0x42);				// we stellen in hoe de INT pin moet werken en dat het een INT stuurd wnr de data klaar is
 	BMP384_ground(calibData);										// bereken de druk op de grond.
 
 	return HAL_OK;

@@ -76,7 +76,7 @@ HAL_StatusTypeDef BMP384_Init(BMP384_Calib *calibData);
 void BMP384_WriteReg(uint8_t reg, uint8_t val);
 void BMP384_ReadReg(uint8_t reg, uint8_t *pData, uint16_t len);
 float BMP384_ReadData(BMP384_Calib *calibData);
-uint8_t BMP384_IsDataReady();
+uint8_t BMP384_IsDataReady(void);
 float BMP384_CalculateAltitude(float pressure_pa);
 void BMP384_ground(BMP384_Calib *calibData);
 float BMP384_GetTemp(BMP384_Calib *calibData);

@@ -1,3 +1,4 @@
+// hier ben ik
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
@@ -154,26 +155,46 @@ int main(void)
   MX_FATFS_Init();
   MX_UART8_Init();
   /* USER CODE BEGIN 2 */
-    uint8_t is_sx1280_working = SX1280_TestConnection();
-    if(is_sx1280_working == 0){
-        printf("Er is een fout\n");
-        while(1);
+    printf("\n--- DIAGNOSE ---\n");
+
+    // Toon BUSY pin staat voor reset
+    uint8_t busy_before = HAL_GPIO_ReadPin(SX1280_Bussy_GPIO_Port, SX1280_Bussy_Pin);
+    printf("BUSY voor reset: %d (verwacht: 0 of 1)\n", busy_before);
+
+    SX1280_Reset();
+
+    // Toon BUSY pin na reset
+    uint8_t busy_after = HAL_GPIO_ReadPin(SX1280_Bussy_GPIO_Port, SX1280_Bussy_Pin);
+    printf("BUSY na reset:   %d (verwacht: 0)\n", busy_after);
+
+    // GetStatus - verwacht iets rond 0x2C (STDBY_RC), NIET 0x00
+    SX1280_PrintStatus("Na reset");
+
+    // Buffer test
+    printf("\n--- BUFFER TEST ---\n");
+    uint8_t test_payload[] = {0x48, 0x65, 0x6C, 0x6C, 0x6F}; // "Hello"
+    SX1280_WriteBufferArray(0x00, test_payload, sizeof(test_payload));
+    printf("Buffer geschreven: 48 65 6C 6C 6F\n");
+
+    uint8_t readback[5] = {0};
+    SX1280_ReadBuffer(0x00, readback, 5);
+    printf("Teruggelezen:      %02X %02X %02X %02X %02X\n",
+           readback[0], readback[1], readback[2], readback[3], readback[4]);
+
+    if (readback[0] == 0x48 && readback[4] == 0x6F) {
+        printf("SUCCES: SPI werkt!\n");
+    } else {
+        printf("FOUT: check bedrading (MISO=PB14, MOSI=PB15, SCK=PB13, CS=PB12)\n");
     }
-
-    SX1280_Setup_Sniper();
-
-      // zendvermogen, rampup time: 13 dBm, 20us
-      SX1280_SetTxParams(0x1F, 0xE0);
-
-      //uint32_t last_send_time = 0;
-      //uint8_t test_payload[] = {0x48, 0x65, 0x6C, 0x6C, 0x6F}; // "Hello"
-      SX1280_SetTxContinuousWave();
     /* USER CODE END 2 */
 
     /* USER CODE BEGIN WHILE */
     while (1)
     {
-    	/*
+        HAL_Delay(1000);
+        printf(".\n");
+
+        /*
         if (rx_packet_flag == 1)
         {
             rx_packet_flag = 0;
@@ -182,11 +203,8 @@ int main(void)
 
         int8_t rssi = SX1280_GetRssiInst();
         printf("RSSI: %d dBm\n", rssi);
-        HAL_Delay(5);
-    }
-    */
-    	HAL_Delay(1000);
-    	      printf("Zendt continu op 2.4 GHz...\n");
+        HAL_Delay(500);
+        */
     }
     /* USER CODE END 3 */
 }

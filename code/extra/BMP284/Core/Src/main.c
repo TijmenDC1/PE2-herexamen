@@ -189,9 +189,10 @@ int main(void)
 	  		  //printf("BMP284:\r\n De druk(pa) = %f\nDe hoogte(m) = %f, De temp = %f\n", pressure_pa, hoogte, temp);
 	  if(g_new_pressure_data == 1){
 		  float pressure_pa = BMP384_ReadData(&calibData); // in pascal
-		  float hoogte = BMP384_CalculateAltitude(pressure_pa);
-		  float temp = BMP384_GetTemp(&calibData);
-		  printf("BMP284:\r\n De druk(pa) = %f\nDe hoogte(m) = %f, De temp = %f\n", pressure_pa, hoogte, temp);
+		  //float hoogte = BMP384_CalculateAltitude(pressure_pa);
+		  //float temp = BMP384_GetTemp(&calibData);
+		  //printf("BMP284:\r\n De druk(pa) = %f\nDe hoogte(m) = %f, De temp = %f\n", pressure_pa, hoogte, temp);
+		  printf("BMP284:\r\n De druk(pa) = %f\n", pressure_pa);
 		  g_new_pressure_data = 0;
 	  }
     /* USER CODE END WHILE */
