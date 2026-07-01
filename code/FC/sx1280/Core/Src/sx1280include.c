@@ -77,14 +77,10 @@ void SX1280_getstatus(void)
 void SX1280_Reset(void)
 {
     HAL_GPIO_WritePin(SX1280_nRST_GPIO_Port, SX1280_nRST_Pin, 0);
-    HAL_Delay(20);
-    __asm__ volatile ("NOP \n NOP \n NOP");
+    HAL_Delay(50);
     HAL_GPIO_WritePin(SX1280_nRST_GPIO_Port, SX1280_nRST_Pin, 1);
-    HAL_Delay(20);          // iets langer wachten
+    HAL_Delay(50);
     SX1280_BUSY();
-
-    SX1280_getstatus();
-    SX1280_getstatus();
 
     // Zet chip in STDBY_RC
     /*
@@ -261,8 +257,8 @@ void SX1280_SetDioIrqParams()
 {
     // RxDone interrupt is bit 1 (0x0002) in het register
     uint16_t irqMask = 0x0002;  // Welke interrupts we in de chip willen activeren
-    uint16_t dio1Mask = 0x0000; // Welke interrupts DIO1 hoog mogen maken
-    uint16_t dio2Mask = 0x0002; // Gebruiken we niet
+    uint16_t dio1Mask = 0x0002; // RxDone op DIO1 (verbonden met PD15)
+    uint16_t dio2Mask = 0x0000; // Gebruiken we niet
     uint16_t dio3Mask = 0x0000; // Gebruiken we niet
 
     uint8_t buf[9];
