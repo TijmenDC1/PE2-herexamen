@@ -8,9 +8,10 @@
 // attitude.c
 #include "attitude.h"
 #include "main.h"
+#include "fc_config.h"
 #include <math.h>
 
-#define ALPHA 0.98f
+#define ALPHA ATTITUDE_ALPHA
 
 void Attitude_AccelAngles(float ax, float ay, float az, float *roll, float *pitch)
 {

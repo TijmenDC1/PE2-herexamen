@@ -26,6 +26,7 @@
 //#include "BMP384.h"
 //#include "BMM350.h"
 //#include "BMI330.h"
+#include "fc_config.h"   // alle instelbare waarden staan hier
 #include "MPU6050.h"
 #include "attitude.h"
 #include "AnglePID.h"
@@ -87,20 +88,13 @@ static void MX_TIM4_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-float g_hoogte;
-float g_druk;
-float g_hoek;
-float g_pitch;
-float g_roll;
-float g_temp;
-int g_acc;
-int g_gyr;
-float alpha = 0.98; // hoe hoger hoe meer de acc gaat doortellen
-float dt = 0.02;   // voor 50hz
-float gefilterde_hoogte = 0;
-float verticale_snelheid = 0;
-int g_new_bmm_data = 0;
-int g_new_bmi_data = 0;
+/* Placeholders voor sensoren die nog niet in gebruik zijn (BMP384 hoogtemeting,
+ * BMM350 magnetometer, BMI330 IMU). De bijbehorende code staat verderop
+ * uitgecommentarieerd; zet deze variabelen terug zodra je die activeert.
+ *
+ * float g_hoogte, g_druk;
+ * int g_new_bmm_data, g_new_bmi_data;
+ */
 
 int _write(int file, char *ptr, int len) {
 	for(int i = 0; i < len; i++){
@@ -111,13 +105,6 @@ int _write(int file, char *ptr, int len) {
 	}
     return len;
 }
-/*
-void Update_Altitude_Filter(float baro_hoogte, float acc_z_m_s2) {
-    verticale_snelheid += acc_z_m_s2 * dt;
-    float voorspelde_hoogte = gefilterde_hoogte + (verticale_snelheid * dt);
-    gefilterde_hoogte = (alpha * voorspelde_hoogte) + ((1 - alpha) * baro_hoogte);
-}
-*/
 float accel_x, accel_y, accel_z;
 float gyro_x, gyro_y, gyro_z;
 
@@ -154,28 +141,7 @@ static inline uint32_t micros(void) {
 // dshot
 volatile uint8_t dshot_dma_complete = 1;
 
-// tilt -> throttle mapping (test-instellingen, pas gerust aan)
-// LET OP: BASE moet tussen MIN en MAX liggen, met genoeg ruimte naar beide kanten
-// voor de PID-correcties. Staat BASE onder MIN, dan worden alle motoren naar MIN
-// geklemd en zie je geen enkel verschil meer tussen de motoren.
-// Stuwkracht loopt KWADRATISCH met toerental: op lage basis-throttle levert een
-// klein throttle-verschil nauwelijks koppel. Voor echte stuurautoriteit moet de
-// basis richting het zweefpunt liggen (grofweg 40-50% = 800-1000).
-#define THROTTLE_BASE     600   // throttle bij vlak liggen (moet > MIN zijn!)
-#define THROTTLE_MIN      200   // absoluut minimum (0-47 = dshot commando's) en 48-149 is schokkend = te lage bemf
-#define THROTTLE_MAX      1200  // veiligheidsgrens voor deze test, met prop erop!
-
-// --- FAILSAFE ---
-// Slaat de motoren af als de drone te ver doorslaat (bv. door een verkeerd
-// mixer-teken -> positieve terugkoppeling -> op hol slaan) of als de testtijd
-// om is. Eenmaal afgeslagen blijven de motoren uit tot je opnieuw opstart.
-// LET OP: pitch kan wiskundig maar tot +/-90 graden komen (atan2 met sqrt) en
-// roll tot +/-180. Een grens van 200 betekent dus in de praktijk: hoek-failsafe
-// staat UIT. Handig tijdens het uitzoeken op de teststaaf, want dan mag hij
-// gerust omslaan en ondersteboven hangen. Zet dit terug naar ~45 zodra je
-// echt gaat tunen, en zeker voordat er propellers op gaan.
-#define FAILSAFE_ANGLE    80.0f // graden; daarboven direct motoren uit
-#define FAILSAFE_TIMEOUT  30.0f  // seconden; automatische stop na deze tijd
+// Alle instelbare waarden staan in fc_config.h
 static uint8_t motors_killed = 0;
 
 // Zet 1 frame klaar voor alle 4 de motoren en verstuur het (met handshake op de
@@ -199,7 +165,7 @@ static void motors_send(int t1, int t2, int t3, int t4) {
 }
 
 // Houdt een vaste throttle-combinatie 'seconds' seconden aan.
-static void hold_motors(int t1, int t2, int t3, int t4, float seconds) {
+void hold_motors(int t1, int t2, int t3, int t4, float seconds) {
     int frames = (int)(seconds * 50.0f); // ~50 frames/s bij HAL_Delay(20)
     for (int f = 0; f < frames; f++) {
         motors_send(t1, t2, t3, t4);
@@ -215,16 +181,13 @@ static void hold_motors(int t1, int t2, int t3, int t4, float seconds) {
 #define DSHOT_CMD_SPIN_DIRECTION_NORMAL    20
 #define DSHOT_CMD_SPIN_DIRECTION_REVERSED  21
 
-// Op 1: gebruik commando 7/8 i.p.v. 20/21. Oudere BLHeli_S-firmware kent
-// alleen die eerste twee. Werkt 20/21 niet, probeer dan deze.
-#define USE_OLD_DIRECTION_CMDS  0
 
 // Stuurt een DShot-commando naar 1 motor. De overige motoren krijgen throttle 0.
 // Let op: dit vult de buffer RECHTSTREEKS, want motors_send() klemt 1..47 naar 0.
 // De telemetrie-bit moet 1 zijn, anders herkent de ESC het niet als commando.
 // Commando's moeten herhaald worden (BLHeli wil er meestal 6 tot 10) en de ESC
 // mag op dat moment NIET draaien.
-static void dshot_command(int idx, uint16_t cmd, int repeats) {
+void dshot_command(int idx, uint16_t cmd, int repeats) {
     for (int i = 0; i < repeats; i++) {
         while (dshot_dma_complete == 0) { }
         dshot_dma_complete = 0;
@@ -242,7 +205,7 @@ static void dshot_command(int idx, uint16_t cmd, int repeats) {
 
 // Zet de draairichting van 1 motor en slaat die op in de ESC.
 // reversed = 1 -> omgekeerd, 0 -> normaal.
-static void dshot_set_direction(int idx, int reversed) {
+void dshot_set_direction(int idx, int reversed) {
 #if USE_OLD_DIRECTION_CMDS
     uint16_t cmd = reversed ? DSHOT_CMD_SPIN_DIRECTION_2
                             : DSHOT_CMD_SPIN_DIRECTION_1;
@@ -264,7 +227,7 @@ static void dshot_set_direction(int idx, int reversed) {
 // richtingswissel aan de ESC-firmware. Hoor je NIETS, dan worden commando's
 // helemaal niet herkend en heeft de richtingswissel ook geen kans.
 // Beep-commando's moeten minstens 260 ms uit elkaar staan.
-static void dshot_beep_test(void) {
+void dshot_beep_test(void) {
     printf("\n=== PIEPTEST: elke motor hoort te piepen ===\n");
     for (int m = 0; m < 4; m++) {
         printf("  M%d piep...\n", m + 1);
@@ -276,7 +239,7 @@ static void dshot_beep_test(void) {
 
 // Draait elke motor 1 voor 1 op 'spin' throttle (~1,5 s per motor), de rest uit.
 // Zo kun je controleren of M1..M4 op de juiste plek zitten en draairichting klopt.
-static void test_motors_sequence(uint16_t spin) {
+void test_motors_sequence(uint16_t spin) {
     for (int m = 0; m < 4; m++) {
         printf("Test motor M%d...\n", m + 1);
         int t[4] = { 0, 0, 0, 0 };
@@ -290,7 +253,7 @@ static void test_motors_sequence(uint16_t spin) {
 // De stilstaande motor is degene die op dat moment wordt aangekondigd - veel
 // makkelijker te zien/voelen dan 1 draaiende motor tussen 3 stille.
 // Elke stap duurt 5 s, met 2 s alles-uit ertussen als duidelijke scheiding.
-static void test_motors_identify(uint16_t spin) {
+void test_motors_identify(uint16_t spin) {
     printf("\n=== IDENTIFICATIE: de STILSTAANDE motor is de aangekondigde ===\n");
     for (int m = 0; m < 4; m++) {
         printf("\n>>> M%d STAAT STIL (de andere 3 draaien) - kijk welke stilstaat!\n", m + 1);
@@ -307,7 +270,7 @@ static void test_motors_identify(uint16_t spin) {
 // RAMP-TEST voor 1 motor: bouwt langzaam op van t_start naar t_end en print
 // elke stap. Zo vind je exact de throttle waarbij het misgaat, en na een reset
 // zie je in de terminal tot hoever hij kwam. idx is 0..3 (M1..M4).
-static void test_motor_ramp(int idx, int t_start, int t_end, int steps) {
+void test_motor_ramp(int idx, int t_start, int t_end, int steps) {
     printf("\n>>> RAMP-TEST M%d: %d -> %d\n", idx + 1, t_start, t_end);
     for (int i = 0; i <= steps; i++) {
         int t = t_start + ((t_end - t_start) * i) / steps;
@@ -323,7 +286,7 @@ static void test_motor_ramp(int idx, int t_start, int t_end, int steps) {
 // PAAR-TEST: draait 2 gekozen motoren tegelijk, de andere 2 staan stil.
 // Gebruik dit om te bevestigen dat je voor-paar / achter-paar klopt.
 // Indices zijn 0..3 (dus M1=0, M2=1, M3=2, M4=3).
-static void test_motor_pair(int idx_a, int idx_b, uint16_t spin, const char *label) {
+void test_motor_pair(int idx_a, int idx_b, uint16_t spin, const char *label) {
     printf("\n>>> PAAR-TEST: %s (M%d + M%d draaien)\n", label, idx_a + 1, idx_b + 1);
     int t[4] = { 0, 0, 0, 0 };
     t[idx_a] = spin;
@@ -366,21 +329,6 @@ static int last_motor[4] = { 0, 0, 0, 0 };
 // Het moduletje zit mogelijk gedraaid op het frame. Test: kantel de NEUS omlaag
 // en kijk welke waarde verandert. Hoort 'pitch' te zijn. Verandert 'roll'
 // i.p.v. pitch, dan staat de sensor 90 graden gedraaid -> zet deze op 1.
-// Op 1: motoren blijven UIT en we printen alleen de hoeken. Gebruik dit om
-// veilig te controleren of de IMU-oriëntatie klopt, VOOR je iets laat draaien.
-// Zet terug op 0 zodra pitch/roll de juiste kant op bewegen.
-#define ANGLE_CHECK_ONLY 0
-
-// Op 1: bij het opstarten wordt de draairichting van M2 en M4 omgekeerd en in
-// de ESC opgeslagen. Eenmalig gebruiken, daarna terug op 0. PROPS ERAF.
-#define SET_MOTOR_DIRECTIONS 0
-
-#define IMU_ROTATED_90   1  // 0 = sensor recht gemonteerd, 1 = 90 graden gedraaid
-// Gemeten level-offset roll = -172 graden -> de Z-as wijst omlaag, de sensor
-// staat dus ONDERSTEBOVEN. Met deze vlag op 1 draaien we hem 180 graden terug.
-// Klopt het: na kalibratie moet de offset klein zijn (een paar graden), niet ~180.
-#define IMU_UPSIDE_DOWN  1  // 0 = normaal, 1 = sensor ondersteboven gemonteerd
-
 static inline void imu_to_frame(float ax, float ay, float az, float gx, float gy,
                                  float *f_ax, float *f_ay, float *f_az,
                                  float *f_gx, float *f_gy) {
@@ -495,7 +443,7 @@ int main(void)
 
   // gyro-offset wegkalibreren: plaat moet hierbij STIL liggen
   printf("Gyro kalibreren, plaat stil houden...\n");
-  MPU6050_Calibrate_Gyro(1000);
+  MPU6050_Calibrate_Gyro(GYRO_CALIB_SAMPLES);
   printf("Gyro gekalibreerd.\n");
 
   // Montage-offset van de IMU meten: het FRAME moet hierbij waterpas staan.
@@ -504,7 +452,7 @@ int main(void)
   printf("Level kalibreren, frame WATERPAS en stil houden...\n");
   {
       float sum_r = 0.0f, sum_p = 0.0f;
-      const int n = 500;
+      const int n = LEVEL_CALIB_SAMPLES;
       for (int i = 0; i < n; i++) {
           float ax, ay, az, r, p;
           float fax, fay, faz, dummy_gx, dummy_gy;
@@ -532,9 +480,12 @@ int main(void)
   // Argumenten: kp, ki, kd, integral_limit, output_limit
   // output_limit 300 = de PID mag een motor 300 boven/onder de basis zetten.
   // Stond op 100, dat was te weinig om het frame echt terug te duwen.
-  //                        kp     ki     kd    i-limit  out-limit
-  PID_Angle_Init(&pid_roll,  9.0f, 0.05f, 0.8f, 100.0f, 500.0f);
-  PID_Angle_Init(&pid_pitch, 9.0f, 0.05f, 0.8f, 100.0f, 500.0f);
+  PID_Angle_Init(&pid_roll,  PID_KP, PID_KI, PID_KD,
+                 PID_INTEGRAL_LIMIT, PID_OUTPUT_LIMIT);
+  PID_Angle_Init(&pid_pitch, PID_KP, PID_KI, PID_KD,
+                 PID_INTEGRAL_LIMIT, PID_OUTPUT_LIMIT);
+  pid_roll.d_cutoff_hz  = PID_D_CUTOFF_HZ;
+  pid_pitch.d_cutoff_hz = PID_D_CUTOFF_HZ;
 
   // DShot arming: de ESC accepteert pas gas na een langere periode throttle=0.
   // Eerst wachten tot de ESC zelf klaar is met opstarten (piepjes), daarna een
@@ -1139,14 +1090,8 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/*
-void Update_Motors(uint16_t throttle, int16_t roll, int16_t pitch, int16_t yaw) {
-    int16_t m1 = throttle + pitch + roll - yaw; // Linksvoor
-    int16_t m2 = throttle + pitch - roll + yaw; // Rechtsvoor
-    int16_t m3 = throttle - pitch + roll + yaw; // Linksachter
-    int16_t m4 = throttle - pitch - roll - yaw; // Rechtsachter
-}
-*/
+/* De actieve mixer staat bovenin dit bestand (Update_Motors met tekentabellen). */
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 /*
