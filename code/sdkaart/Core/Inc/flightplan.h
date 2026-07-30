@@ -34,8 +34,10 @@ typedef enum {
     CMD_HOVER,
     CMD_THROTTLE,
     CMD_MOVE,
+    CMD_LEFT,
+    CMD_RIGHT,
+    CMD_LAND,
 } FlightCmdType_t;
-
 typedef struct {
     FlightCmdType_t type;
     float param[3];   // param[0..2] afhankelijk van commando

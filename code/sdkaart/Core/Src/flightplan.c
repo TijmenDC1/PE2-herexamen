@@ -14,19 +14,29 @@
 #define FLIGHTPLAN_MAX_FILE_SIZE  4096
 #define LINE_MAX_LEN              128
 
-// Zet een tekstregel om naar een FlightCmd_t
-// Retourneert 0 als onbekend commando (wordt overgeslagen)
+//Zet een tekstregel om naar een FlightCmd_t
+//Retourneert 0 als onbekend commando (overgeslagen)
+//mogelijke tokens: relativeheight en absolute height is de barometer nodig die momenteel niet werkt
+//hover ook de barometer voor nodig
+//throtle gaan we overeen laten komen met hoe de controler het doet
+// move is de gps voor nodig dus momenteel ook niet nodig
+//left and right ook overeen laten komen met de besturing van de controller
+//land afbouwen van de gas zodat er gezakt word ook eig pas bruikbaar vanaf de barometer aanwezig is
+
 static uint8_t parse_line(const char *line, FlightCmd_t *cmd)
 {
     cmd->type = CMD_UNKNOWN;
     cmd->param[0] = 0;
     cmd->param[1] = 0;
     cmd->param[2] = 0;
+    //max 3 parameter bij move bijvoorbeeld x,y,z
 
-    if (line == NULL || line[0] == '\0' || line[0] == '#') return 0;
+    if (line == NULL || line[0] == '\0' || line[0] == '#')
+        return 0;
 
     char token[32];
-    if (sscanf(line, "%31s", token) != 1) return 0;
+    if (sscanf(line, "%31s", token) != 1)
+        return 0;
 
     if (strcmp(token, "RelativeHeight") == 0) {
         if (sscanf(line, "%*s %f", &cmd->param[0]) == 1) {
@@ -57,17 +67,34 @@ static uint8_t parse_line(const char *line, FlightCmd_t *cmd)
             cmd->type = CMD_MOVE;
             return 1;
         }
+
+    } else if (strcmp(token, "Left") == 0) {
+        if (sscanf(line, "%*s %f", &cmd->param[0]) == 1) {
+            cmd->type = CMD_LEFT;
+            return 1;
+        }
+
+    } else if (strcmp(token, "Right") == 0) {
+        if (sscanf(line, "%*s %f", &cmd->param[0]) == 1) {
+            cmd->type = CMD_RIGHT;
+            return 1;
+        }
+
+    } else if (strcmp(token, "Land") == 0) {
+        cmd->type = CMD_LAND;
+        return 1;
     }
 
-    //Onbekend of fout formaat → overslaan
+    //Onbekend of fout formaat -> overslaan
     printf("flightplan: onbekend commando overgeslagen: %s\n", line);
     return 0;
 }
 
+
 int FlightPlan_Load(FlightPlan_t *plan, const char *filename)
 {
-    plan->count   = 0;
-    plan->current = 0;
+    plan->count   = 0; //hoeveelheid commando's
+    plan->current = 0; // welk commando
 
     //Lees het volledige bestand in één keer
     static uint8_t file_buf[FLIGHTPLAN_MAX_FILE_SIZE];
@@ -78,9 +105,9 @@ int FlightPlan_Load(FlightPlan_t *plan, const char *filename)
         printf("flightplan: bestand niet gevonden: %s\n", filename);
         return -1;
     }
-    file_buf[bytes_read] = '\0';
+    file_buf[bytes_read] = '\0'; //bij elke string een nul terminatie toevoegen
 
-    // Parseer regel voor regel
+    //regel voor regel
     char line[LINE_MAX_LEN];
     char *cursor = (char *)file_buf;
 
@@ -99,17 +126,20 @@ int FlightPlan_Load(FlightPlan_t *plan, const char *filename)
     return plan->count;
 }
 
+//checken of er nog commanos komen
 uint8_t FlightPlan_HasNext(FlightPlan_t *plan)
 {
     return plan->current < plan->count;
 }
 
+//leest het volgende commando
 FlightCmd_t *FlightPlan_Next(FlightPlan_t *plan)
 {
     if (!FlightPlan_HasNext(plan)) return NULL;
     return &plan->cmds[plan->current++];
 }
 
+//zet terug naar 0 om hetzelfde vliegplan nog eens uitte voeren
 void FlightPlan_Reset(FlightPlan_t *plan)
 {
     plan->current = 0;
