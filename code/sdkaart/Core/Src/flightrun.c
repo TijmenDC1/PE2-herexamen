@@ -7,6 +7,7 @@
  */
 
 #include "flightrun.h"
+#include "main.h"
 #include "sdcard.h"
 #include "flightplan.h"
 #include "flightcontrol.h"
@@ -39,7 +40,11 @@ void FlightRun_Execute(void)
     }
 
     // Stap 3: PID('s) initialiseren
-    //
+    if (FlightControl_Init() != 0) {
+        printf("kon vluchtregeling niet initialiseren, vlucht geannuleerd\n");
+        SDCard_Unmount();
+        return;
+    }
 
     // Stap 4: vluchtplan uitvoeren (blokkerend tot het plan afgelopen is)
     printf("start uitvoering van %d commando's\n", n);

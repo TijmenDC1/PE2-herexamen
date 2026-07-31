@@ -1,0 +1,27 @@
+# vluchtplan.txt - eerste voorzichtige testvlucht
+# Formaat: zie flightplan.h - 1 commando per lijn, regels met # zijn commentaar
+#
+# BELANGRIJK VOOR DE EERSTE RUN:
+#  - test dit EERST zonder propellers (of vastgezet op een teststaaf/frame)
+#  - FlightControl_Init() kalibreert de gyro en het level: plaat/frame moet
+#    dan STIL en WATERPAS liggen (zie de printf's over UART8)
+#  - RelativeHeight/AbsoluteHeight/Hover/Move worden nog overgeslagen
+#    (barometer/GPS nodig), dus die staan hieronder niet in
+#
+# Throttle <percent 0-100> <duur in ms>
+# 30% komt overeen met throttle=500 (tussen THROTTLE_MIN=200 en THROTTLE_MAX=1200)
+Throttle 30 2000
+
+# 40% ~ THROTTLE_BASE (600) uit fc_config.h, het punt waarmee de teammate getuned heeft
+Throttle 40 3000
+
+# Left/Right <duur in ms> - kantelt met vaste LEFT_RIGHT_TILT_DEG (15 graden)
+# check zelf of de kantelrichting klopt, teken is nog niet op de drone getest
+Left 1000
+Right 1000
+
+# terug even rustig hangen voor de landing
+Throttle 35 1500
+
+# bouwt throttle rustig af naar 0 en zet de motoren definitief uit
+Land
