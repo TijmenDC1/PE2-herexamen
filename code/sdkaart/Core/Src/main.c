@@ -28,6 +28,7 @@
 //#include "BMI330.h"
 //#include "pid_regulator.h"
 #include "Flightrun.h"
+#include "sdcard.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -109,6 +110,60 @@ static void MX_UART8_Init(void);
 
 int g_new_pressure_data = 0;
 
+/* Zet op 0 na de eerste geslaagde flash+run, anders overschrijft elke boot
+ * vluchtplan.txt opnieuw met deze vaste inhoud (bv. als je het bestand
+ * nadien via de firmware zelf wil aanpassen, wat dan telkens verloren gaat). */
+#define WRITE_FLIGHTPLAN_TO_SD 1
+
+#if WRITE_FLIGHTPLAN_TO_SD
+/* Eenmalige tool omdat dit bordje geen SD-kaartlezer op de PC heeft: schrijft
+ * vluchtplan.txt rechtstreeks via de SDMMC1/FATFS-stack naar de SD-kaart die
+ * in de houder op het bordje zit. */
+static const char flightplan_vluchtplan_txt[] =
+"# vluchtplan.txt - eerste voorzichtige testvlucht\n"
+"# Formaat: zie flightplan.h - 1 commando per lijn, regels met # zijn commentaar\n"
+"#\n"
+"# BELANGRIJK VOOR DE EERSTE RUN:\n"
+"#  - test dit EERST zonder propellers (of vastgezet op een teststaaf/frame)\n"
+"#  - FlightControl_Init() kalibreert de gyro en het level: plaat/frame moet\n"
+"#    dan STIL en WATERPAS liggen (zie de printf's over UART8)\n"
+"#  - RelativeHeight/AbsoluteHeight/Hover/Move worden nog overgeslagen\n"
+"#    (barometer/GPS nodig), dus die staan hieronder niet in\n"
+"#\n"
+"# Throttle <percent 0-100> <duur in ms>\n"
+"# 30% komt overeen met throttle=500 (tussen THROTTLE_MIN=200 en THROTTLE_MAX=1200)\n"
+"Throttle 30 2000\n"
+"\n"
+"# 40% ~ THROTTLE_BASE (600) uit fc_config.h, het punt waarmee de teammate getuned heeft\n"
+"Throttle 40 3000\n"
+"\n"
+"# Left/Right <duur in ms> - kantelt met vaste LEFT_RIGHT_TILT_DEG (15 graden)\n"
+"# check zelf of de kantelrichting klopt, teken is nog niet op de drone getest\n"
+"Left 1000\n"
+"Right 1000\n"
+"\n"
+"# terug even rustig hangen voor de landing\n"
+"Throttle 35 1500\n"
+"\n"
+"# bouwt throttle rustig af naar 0 en zet de motoren definitief uit\n"
+"Land\n";
+
+static void WriteFlightplanToSD(void)
+{
+    if (SDCard_Mount() != SDCARD_OK) {
+        printf("kon SD-kaart niet mounten om vluchtplan.txt te schrijven\n");
+        return;
+    }
+    if (SDCard_WriteFile("vluchtplan.txt", (const uint8_t *)flightplan_vluchtplan_txt,
+                          sizeof(flightplan_vluchtplan_txt) - 1) == SDCARD_OK) {
+        printf("vluchtplan.txt succesvol weggeschreven naar de SD-kaart\n");
+    } else {
+        printf("schrijven van vluchtplan.txt is mislukt\n");
+    }
+    SDCard_Unmount();
+}
+#endif /* WRITE_FLIGHTPLAN_TO_SD */
+
 int _write(int file, char *ptr, int len) {
 	for(int i = 0; i < len; i++){
 		if(ptr[i]=='\n'){
@@ -178,6 +233,9 @@ int main(void)
   MX_UART8_Init();
   /* USER CODE BEGIN 2 */
   BMP384_Init(&calibData);
+#if WRITE_FLIGHTPLAN_TO_SD
+  WriteFlightplanToSD();
+#endif
   FlightRun_Execute(); // mount SD, laadt vluchtplan.txt, initialiseert PID/MPU6050 en voert het uit
   /* USER CODE END 2 */
 

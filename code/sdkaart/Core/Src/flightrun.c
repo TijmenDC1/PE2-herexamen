@@ -20,13 +20,13 @@ static FlightPlan_t plan;
 
 void FlightRun_Execute(void)
 {
-    // Stap 1: SD kaart mounten
+    //1 SD kaart mounten
     if (SDCard_Mount() != SDCARD_OK) {
         printf("kon SD kaart niet mounten, vlucht geannuleerd\n");
         return;
     }
 
-    // Stap 2: vluchtplan inladen
+    //vluchtplan inladen
     int n = FlightPlan_Load(&plan, FLIGHTPLAN_FILENAME);
     if (n < 0) {
         printf("vluchtplan bestand niet gevonden, vlucht geannuleerd\n");
@@ -39,14 +39,14 @@ void FlightRun_Execute(void)
         return;
     }
 
-    // Stap 3: PID('s) initialiseren
+    //PID('s) initialiseren
     if (FlightControl_Init() != 0) {
         printf("kon vluchtregeling niet initialiseren, vlucht geannuleerd\n");
         SDCard_Unmount();
         return;
     }
 
-    // Stap 4: vluchtplan uitvoeren (blokkerend tot het plan afgelopen is)
+    //vluchtplan uitvoeren (blokkerend tot het plan afgelopen is)
     printf("start uitvoering van %d commando's\n", n);
     FlightControl_Run(&plan, HAL_GetTick, HAL_Delay, CONTROL_LOOP_DT_MS);
     printf("vluchtplan volledig uitgevoerd\n");
