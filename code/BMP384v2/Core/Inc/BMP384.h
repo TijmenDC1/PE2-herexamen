@@ -21,6 +21,7 @@ typedef enum {
     BMP384_OK = 0,
     BMP384_ERR_SPI, /*een SPI-transactie is mislukt/timeout */
     BMP384_ERR_ID,  /*chip-ID komt niet overeen (verkeerde sensor/bekabeling) */
+    BMP384_ERR_DATA,/*SPI werkt, maar de ruwe ADC-data is 0x000000 of 0xFFFFFF */
 } BMP384_Status;
 
 /*Verifieert de chip-ID, doet een soft-reset, leest de fabriekskalibratie uit
@@ -36,6 +37,17 @@ uint8_t BMP384_IsDataReady(void);
 BMP384_Status BMP384_ReadPressureTemperature(BMP384_Calib *calib,
                                               float *pressure_pa,
                                               float *temperature_c);
+
+/*Leest de ongecompenseerde 24-bit ADC-waarden uit. Handig om te debuggen:
+ *als deze 0 of 0xFFFFFF zijn, ligt het probleem bij SPI/config, niet bij de
+ *compensatieformules. */
+BMP384_Status BMP384_ReadRaw(uint32_t *raw_press, uint32_t *raw_temp);
+
+/*Dumpt alle relevante registers en controleert of SENSORTIME doorloopt. */
+void BMP384_Diagnose(void);
+
+/*Doet 1 meting in forced mode met de simpelst mogelijke instellingen. */
+BMP384_Status BMP384_ForcedTest(uint32_t *raw_press, uint32_t *raw_temp);
 
 /*Rekent een pascalwaarde om naar hoogte (m) t.o.v. ground_pressure_pa. */
 float BMP384_PressureToAltitude(float pressure_pa, float ground_pressure_pa);

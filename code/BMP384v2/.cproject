@@ -80,8 +80,9 @@
 						</toolChain>
 					</folderInfo>
 					<sourceEntries>
-						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Middlewares"/>
 						<entry excluding="Src/BMI330.c|Src/pid_regulator.c|Src/BMM350.c|Src/dshot.c|Src/MPU6050.c|Src/flightcontrol.c|Src/flightrun.c|Src/sdcard.c|Src/flightplan.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Core"/>
+						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="FATFS"/>
+						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Middlewares"/>
 						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Drivers"/>
 					</sourceEntries>
 				</configuration>
@@ -161,6 +162,7 @@
 					</folderInfo>
 					<sourceEntries>
 						<entry excluding="Src/BMI330.c|Src/pid_regulator.c|Src/BMM350.c|Src/dshot.c|Src/MPU6050.c|Src/flightcontrol.c|Src/flightrun.c|Src/sdcard.c|Src/flightplan.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Core"/>
+						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="FATFS"/>
 						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Middlewares"/>
 						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Drivers"/>
 					</sourceEntries>

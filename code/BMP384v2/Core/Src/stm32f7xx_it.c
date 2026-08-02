@@ -54,6 +54,11 @@
 
 /* USER CODE END 0 */
 
+/* External variables --------------------------------------------------------*/
+extern DMA_HandleTypeDef hdma_tim2_up_ch3;
+extern DMA_HandleTypeDef hdma_tim2_ch1;
+extern DMA_HandleTypeDef hdma_tim4_ch1;
+extern DMA_HandleTypeDef hdma_tim4_ch2;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -218,7 +223,7 @@ void DMA1_Stream0_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Stream0_IRQn 0 */
 
   /* USER CODE END DMA1_Stream0_IRQn 0 */
-  /* niet gebruikt: geen DMA meer geconfigureerd in dit barometer-only project */
+  HAL_DMA_IRQHandler(&hdma_tim4_ch1);
   /* USER CODE BEGIN DMA1_Stream0_IRQn 1 */
 
   /* USER CODE END DMA1_Stream0_IRQn 1 */
@@ -232,7 +237,7 @@ void DMA1_Stream1_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Stream1_IRQn 0 */
 
   /* USER CODE END DMA1_Stream1_IRQn 0 */
-  /* niet gebruikt: geen DMA meer geconfigureerd in dit barometer-only project */
+  HAL_DMA_IRQHandler(&hdma_tim2_up_ch3);
   /* USER CODE BEGIN DMA1_Stream1_IRQn 1 */
 
   /* USER CODE END DMA1_Stream1_IRQn 1 */
@@ -246,7 +251,7 @@ void DMA1_Stream3_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Stream3_IRQn 0 */
 
   /* USER CODE END DMA1_Stream3_IRQn 0 */
-  /* niet gebruikt: geen DMA meer geconfigureerd in dit barometer-only project */
+  HAL_DMA_IRQHandler(&hdma_tim4_ch2);
   /* USER CODE BEGIN DMA1_Stream3_IRQn 1 */
 
   /* USER CODE END DMA1_Stream3_IRQn 1 */
@@ -260,7 +265,7 @@ void DMA1_Stream5_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Stream5_IRQn 0 */
 
   /* USER CODE END DMA1_Stream5_IRQn 0 */
-  /* niet gebruikt: geen DMA meer geconfigureerd in dit barometer-only project */
+  HAL_DMA_IRQHandler(&hdma_tim2_ch1);
   /* USER CODE BEGIN DMA1_Stream5_IRQn 1 */
 
   /* USER CODE END DMA1_Stream5_IRQn 1 */
