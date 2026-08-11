@@ -168,8 +168,27 @@ int main(void)
   while (1)
   {
 	  if (mag_status != BMM350V2_OK) {
-		  printf("BMM350v2: niet geinitialiseerd, geen metingen\n");
-		  HAL_Delay(1000);
+		  /* Niet eindeloos dezelfde regel spammen: elke 3s opnieuw proberen,
+		   * zodat het vanzelf werkt zodra de sensor wel antwoordt. */
+		  printf("BMM350v2: niet geinitialiseerd, opnieuw proberen...\n");
+		  HAL_Delay(3000);
+		  mag_status = BMM350v2_Init();
+		  if (mag_status == BMM350V2_OK) {
+			  printf("BMM350v2: kalibreren, draai de sensor nu enkele keren rond...\n");
+			  BMM350v2_CalibrateReset(&mag_calib);
+			  for (int i = 0; i < 250; i++) {
+				  if (BMM350v2_IsDataReady()) {
+					  int32_t x, y, z;
+					  if (BMM350v2_ReadRaw(&x, &y, &z) == BMM350V2_OK) {
+						  BMM350v2_CalibrateSample(&mag_calib, x, y, z);
+					  }
+				  }
+				  HAL_Delay(20);
+			  }
+			  BMM350v2_CalibrateFinish(&mag_calib);
+			  printf("BMM350v2: kalibratie klaar (offset x=%.0f y=%.0f z=%.0f)\n",
+			         mag_calib.offset_x, mag_calib.offset_y, mag_calib.offset_z);
+		  }
 	  } else if (BMM350v2_IsDataReady()) {
 		  int32_t x, y, z;
 		  if (BMM350v2_ReadRaw(&x, &y, &z) == BMM350V2_OK) {

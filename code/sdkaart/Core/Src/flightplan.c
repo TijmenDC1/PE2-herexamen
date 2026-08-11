@@ -23,7 +23,7 @@
 //left and right ook overeen laten komen met de besturing van de controller
 //land afbouwen van de gas zodat er gezakt word ook eig pas bruikbaar vanaf de barometer aanwezig is
 
-static uint8_t parse_line(const char *line, FlightCmd_t *cmd)
+uint8_t FlightPlan_ParseLine(const char *line, FlightCmd_t *cmd)
 {
     cmd->type = CMD_UNKNOWN;
     cmd->param[0] = 0;
@@ -117,7 +117,7 @@ int FlightPlan_Load(FlightPlan_t *plan, const char *filename)
             break;
         }
         FlightCmd_t cmd;
-        if (parse_line(line, &cmd)) {
+        if (FlightPlan_ParseLine(line, &cmd)) {
             plan->cmds[plan->count++] = cmd;
         }
     }

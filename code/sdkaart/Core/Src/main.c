@@ -29,6 +29,8 @@
 //#include "pid_regulator.h"
 #include "Flightrun.h"
 #include "sdcard.h"
+#include "flightplan_io.h"
+#include "flightplan_tool.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -110,59 +112,32 @@ static void MX_UART8_Init(void);
 
 int g_new_pressure_data = 0;
 
-/* Zet op 0 na de eerste geslaagde flash+run, anders overschrijft elke boot
- * vluchtplan.txt opnieuw met deze vaste inhoud (bv. als je het bestand
- * nadien via de firmware zelf wil aanpassen, wat dan telkens verloren gaat). */
-#define WRITE_FLIGHTPLAN_TO_SD 1
+/* ==========================================================================
+ * Vluchtplan: schrijven, uitlezen, vliegen
+ *
+ * De plannen zelf staan in flightplan_tool.c als FlightCmd_t-arrays.
+ * Zet deze drie vlaggen naar wat je nu wil doen.
+ * ========================================================================== */
 
-#if WRITE_FLIGHTPLAN_TO_SD
-/* Eenmalige tool omdat dit bordje geen SD-kaartlezer op de PC heeft: schrijft
- * vluchtplan.txt rechtstreeks via de SDMMC1/FATFS-stack naar de SD-kaart die
- * in de houder op het bordje zit. */
-static const char flightplan_vluchtplan_txt[] =
-"# vluchtplan.txt - eerste voorzichtige testvlucht\n"
-"# Formaat: zie flightplan.h - 1 commando per lijn, regels met # zijn commentaar\n"
-"#\n"
-"# BELANGRIJK VOOR DE EERSTE RUN:\n"
-"#  - test dit EERST zonder propellers (of vastgezet op een teststaaf/frame)\n"
-"#  - FlightControl_Init() kalibreert de gyro en het level: plaat/frame moet\n"
-"#    dan STIL en WATERPAS liggen (zie de printf's over UART8)\n"
-"#  - RelativeHeight/AbsoluteHeight/Hover/Move worden nog overgeslagen\n"
-"#    (barometer/GPS nodig), dus die staan hieronder niet in\n"
-"#\n"
-"# Throttle <percent 0-100> <duur in ms>\n"
-"# 30% komt overeen met throttle=500 (tussen THROTTLE_MIN=200 en THROTTLE_MAX=1200)\n"
-"Throttle 30 2000\n"
-"\n"
-"# 40% ~ THROTTLE_BASE (600) uit fc_config.h, het punt waarmee de teammate getuned heeft\n"
-"Throttle 40 3000\n"
-"\n"
-"# Left/Right <duur in ms> - kantelt met vaste LEFT_RIGHT_TILT_DEG (15 graden)\n"
-"# check zelf of de kantelrichting klopt, teken is nog niet op de drone getest\n"
-"Left 1000\n"
-"Right 1000\n"
-"\n"
-"# terug even rustig hangen voor de landing\n"
-"Throttle 35 1500\n"
-"\n"
-"# bouwt throttle rustig af naar 0 en zet de motoren definitief uit\n"
-"Land\n";
+/* 1) SCHRIJVEN. Zet de hardgecodeerde plannen op de SD-kaart. Nodig omdat dit
+ *    bordje geen SD-lezer op de PC heeft. Na de eerste geslaagde flash+run mag
+ *    dit op 0, anders wordt de kaart bij elke boot overschreven. */
+#define WRITE_FLIGHTPLAN_TO_SD  1
 
-static void WriteFlightplanToSD(void)
-{
-    if (SDCard_Mount() != SDCARD_OK) {
-        printf("kon SD-kaart niet mounten om vluchtplan.txt te schrijven\n");
-        return;
-    }
-    if (SDCard_WriteFile("vluchtplan.txt", (const uint8_t *)flightplan_vluchtplan_txt,
-                          sizeof(flightplan_vluchtplan_txt) - 1) == SDCARD_OK) {
-        printf("vluchtplan.txt succesvol weggeschreven naar de SD-kaart\n");
-    } else {
-        printf("schrijven van vluchtplan.txt is mislukt\n");
-    }
-    SDCard_Unmount();
-}
-#endif /* WRITE_FLIGHTPLAN_TO_SD */
+/* 2) UITLEZEN. Leest het actieve plan terug van de kaart en print het genummerd
+ *    over UART8, met validatie. Zo zie je precies wat de drone gaat doen.
+ *    Laat dit gerust op 1 staan, het kost alleen wat opstarttijd. */
+#define DUMP_FLIGHTPLAN_FROM_SD 1
+
+/* 3) VLIEGEN. Op 0 doet het bord alleen schrijven en uitlezen, en blijven de
+ *    motoren gegarandeerd uit: FlightControl_Init() armt de ESC's dan nooit.
+ *    Zo test je de hele SD-keten veilig. Zet dit pas op 1 als de dump hierboven
+ *    er goed uitziet, en dan nog eerst zonder propellers. */
+#define RUN_FLIGHTPLAN          0
+
+/* Print bij het uitlezen ook de ruwe bytes van het bestand, zodat je ziet dat
+ * er echt iets op de kaart staat en niet alleen in RAM. */
+#define DUMP_FLIGHTPLAN_RAW     1
 
 int _write(int file, char *ptr, int len) {
 	for(int i = 0; i < len; i++){
@@ -232,11 +207,56 @@ int main(void)
   MX_FATFS_Init();
   MX_UART8_Init();
   /* USER CODE BEGIN 2 */
-  BMP384_Init(&calibData);
-#if WRITE_FLIGHTPLAN_TO_SD
-  WriteFlightplanToSD();
+
+  /* ---- UART-CHECK ----------------------------------------------------------
+   * Gaat rechtstreeks naar UART8, zonder printf, zonder newlib, zonder SD-kaart.
+   * Dit is het allereerste wat er gebeurt na de peripheral-init.
+   *
+   *   zie je dit WEL maar de rest niet -> probleem zit in printf of in de code erna
+   *   zie je dit NIET                   -> bedrading, baudrate of COM-poort
+   *
+   * Stond op 1 tijdens het zoeken naar de stille UART (bleek de RX/TX-swap te
+   * zijn). Zet hem terug op 1 als je ooit weer niets binnenkrijgt: hij kost
+   * 2 seconden bij het opstarten en zegt je meteen of de lijn zelf goed zit. */
+#define UART_CHECK 0
+#if UART_CHECK
+  for (int i = 0; i < 10; i++) {
+      HAL_UART_Transmit(&huart8, (uint8_t *)"UART8 werkt\r\n", 13, HAL_MAX_DELAY);
+      HAL_Delay(200);
+  }
 #endif
-  FlightRun_Execute(); // mount SD, laadt vluchtplan.txt, initialiseert PID/MPU6050 en voert het uit
+
+  /* printf niet laten bufferen: elke regel gaat meteen de lijn op, ook als het
+   * bord daarna vastloopt of in een failsafe belandt. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+
+  BMP384_Init(&calibData);
+
+  printf("\n\n===== opgestart, vluchtplan-test =====\n");
+
+#if WRITE_FLIGHTPLAN_TO_SD
+  /* SCHRIJVEN: hardgecodeerde plannen -> SD-kaart, met validatie en terugleescontrole */
+  printf("\n[1] SCHRIJVEN\n");
+  FlightPlanTool_ListBuiltin();
+  FlightPlanTool_WriteAll();
+#endif
+
+#if DUMP_FLIGHTPLAN_FROM_SD
+#if DUMP_FLIGHTPLAN_RAW
+  /* de ruwe bytes zoals ze op de kaart staan */
+  printf("\n[2] RUWE INHOUD VAN DE KAART\n");
+  FlightPlanTool_DumpRaw(FLIGHTPLAN_ACTIVE_FILE);
+#endif
+  /* UITLEZEN: SD-kaart -> RAM -> genummerd over UART8 */
+  printf("\n[3] UITLEZEN EN CONTROLEREN\n");
+  FlightPlanTool_Dump(FLIGHTPLAN_ACTIVE_FILE, NULL);
+#endif
+
+#if RUN_FLIGHTPLAN
+  FlightRun_Execute(); // mount SD, laadt het plan, initialiseert PID/MPU6050 en voert het uit
+#else
+  printf("RUN_FLIGHTPLAN staat op 0: motoren blijven uit, er wordt niet gevlogen\n");
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -272,6 +292,10 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
+  /** Configure LSE Drive Capability
+  */
+  HAL_PWR_EnableBkUpAccess();
+
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
@@ -279,19 +303,17 @@ void SystemClock_Config(void)
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
-  *
-  * 216 MHz i.p.v. de vorige 50 MHz: nodig omdat de Dshot-timing (TIM2/TIM4
-  * Period=359, zie dshot.c) op een 108 MHz timerklok is afgestemd, dezelfde
-  * klokconfig als DshotFCMetMPU6050. I2C1-timing hieronder is hierop aangepast.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 8;
-  RCC_OscInitStruct.PLL.PLLN = 216;
+  RCC_OscInitStruct.PLL.PLLN = 200;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 9;
+  RCC_OscInitStruct.PLL.PLLQ = 8;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -311,12 +333,13 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_6) != HAL_OK)
   {
     Error_Handler();
   }
+  HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_HSI, RCC_MCODIV_1);
 }
 
 /**
@@ -335,7 +358,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x20404768; // getuned voor PCLK1=54MHz (zie de nieuwe 216MHz systeemklok hierboven)
+  hi2c1.Init.Timing = 0x00401959;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -498,7 +521,7 @@ static void MX_SPI4_Init(void)
   hspi4.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi4.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi4.Init.NSS = SPI_NSS_SOFT;
-  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
   hspi4.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi4.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi4.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -527,7 +550,6 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
@@ -537,18 +559,9 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 359; // Dshot300-bittiming @ 108MHz timerklok, zie dshot.c
+  htim2.Init.Period = 4294967295;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
   if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
@@ -590,7 +603,6 @@ static void MX_TIM4_Init(void)
 
   /* USER CODE END TIM4_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
@@ -600,18 +612,9 @@ static void MX_TIM4_Init(void)
   htim4.Instance = TIM4;
   htim4.Init.Prescaler = 0;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 359; // Dshot300-bittiming @ 108MHz timerklok, zie dshot.c
+  htim4.Init.Period = 65535;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
   if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
   {
     Error_Handler();
@@ -700,7 +703,8 @@ static void MX_UART8_Init(void)
   huart8.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart8.Init.OverSampling = UART_OVERSAMPLING_16;
   huart8.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart8.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  huart8.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT;
+  huart8.AdvancedInit.Swap = UART_ADVFEATURE_SWAP_ENABLE;
   if (HAL_UART_Init(&huart8) != HAL_OK)
   {
     Error_Handler();

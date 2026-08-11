@@ -36,8 +36,13 @@ typedef struct {
 } BMM350v2_Calib;
 
 /* Verifieert de chip-ID en zet de sensor in normal mode (ODR + averaging,
- * interrupt op data-ready). Blokkerend. */
+ * interrupt op data-ready). Blokkerend. Probeert automatisch de adressen
+ * 0x14/0x15/0x16/0x17 en print bij een fout een I2C-scan van de hele bus. */
 BMM350v2_Status BMM350v2_Init(void);
+
+/* Scant I2C1 en print elk adres dat antwoordt. Handig om te zien of de sensor
+ * überhaupt op de bus hangt en op welk adres. */
+void BMM350v2_ScanBus(void);
 
 /* 1 = nieuwe magnetometerdata beschikbaar, 0 = nog niet. */
 uint8_t BMM350v2_IsDataReady(void);

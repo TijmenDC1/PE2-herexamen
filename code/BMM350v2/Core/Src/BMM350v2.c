@@ -18,9 +18,15 @@ extern I2C_HandleTypeDef hi2c1;
 
 #define I2C_TIMEOUT_MS   100
 
-/* BMM350 is vast op adres 0x14 (SDO/CSB laag) of 0x15 (hoog); dit board
- * gebruikt de default 0x14. HAL verwacht het 8-bit adres (7-bit << 1). */
-#define BMM350_I2C_ADDR       (0x14 << 1)
+/* De BMM350 kan op 4 adressen zitten, afhankelijk van hoe SDO/CSB op het board
+ * bedraad zijn: 0x14, 0x15, 0x16 of 0x17. We proberen ze alle vier bij init
+ * i.p.v. 0x14 hard te veronderstellen. HAL verwacht het 8-bit adres (7-bit << 1). */
+static const uint8_t bmm350_addr_candidates[] = { 0x14, 0x15, 0x16, 0x17 };
+
+/* Het 7-bit adres waarop de sensor daadwerkelijk geantwoord heeft; wordt door
+ * BMM350v2_Init() ingevuld en daarna gebruikt door alle lees-/schrijfacties. */
+static uint8_t bmm350_addr7 = 0x14;
+#define BMM350_I2C_ADDR       ((uint16_t)(bmm350_addr7 << 1))
 
 /* --- registeradressen --- */
 #define REG_CHIP_ID           0x00
@@ -31,6 +37,9 @@ extern I2C_HandleTypeDef hi2c1;
 #define REG_INT_CTRL          0x2E
 #define REG_INT_STATUS        0x30
 #define REG_MAG_X_XLSB        0x31 /* X/Y/Z: 3 bytes elk, vanaf hier aaneengesloten */
+#define REG_CMD               0x7E
+
+#define CMD_SOFTRESET         0xB6
 
 #define CHIP_ID_EXPECTED      0x33
 
@@ -50,7 +59,12 @@ static HAL_StatusTypeDef BMM350v2_WriteReg(uint8_t reg, uint8_t value)
 }
 
 /* De BMM350 stuurt bij elke I2C-leesactie 2 dummy-bytes vóór de echte data
- * (gedocumenteerd gedrag van deze chip, geen protocolfout hier). */
+ * (gedocumenteerd gedrag van deze chip, geen protocolfout hier).
+ *
+ * We gebruiken HAL_I2C_Mem_Read i.p.v. een losse Transmit + Receive: dat doet
+ * een repeated start i.p.v. een STOP tussen het registeradres en de data, wat
+ * is wat de BMM350 verwacht. Met een STOP ertussen vergeet de chip welk
+ * register je wou lezen. */
 static HAL_StatusTypeDef BMM350v2_ReadReg(uint8_t reg, uint8_t *data, uint16_t len)
 {
     uint8_t buf[2 + 32]; /* ruim genoeg voor de 9 bytes (X/Y/Z) die we hier max. lezen */
@@ -60,11 +74,8 @@ static HAL_StatusTypeDef BMM350v2_ReadReg(uint8_t reg, uint8_t *data, uint16_t l
         return HAL_ERROR;
     }
 
-    status = HAL_I2C_Master_Transmit(&hi2c1, BMM350_I2C_ADDR, &reg, 1, I2C_TIMEOUT_MS);
-    if (status != HAL_OK) {
-        return status;
-    }
-    status = HAL_I2C_Master_Receive(&hi2c1, BMM350_I2C_ADDR, buf, (uint16_t)(len + 2), I2C_TIMEOUT_MS);
+    status = HAL_I2C_Mem_Read(&hi2c1, BMM350_I2C_ADDR, reg, I2C_MEMADD_SIZE_8BIT,
+                              buf, (uint16_t)(len + 2), I2C_TIMEOUT_MS);
     if (status != HAL_OK) {
         return status;
     }
@@ -73,6 +84,36 @@ static HAL_StatusTypeDef BMM350v2_ReadReg(uint8_t reg, uint8_t *data, uint16_t l
         data[i] = buf[i + 2];
     }
     return HAL_OK;
+}
+
+/* Vertaalt de HAL-status + ErrorCode naar iets leesbaars, zodat je in de
+ * terminal ziet of het een NACK (niemand antwoordt), een bus-fout (SDA/SCL
+ * blijven laag, meestal ontbrekende pull-ups) of een timeout is. */
+static void BMM350v2_PrintI2CError(const char *what, HAL_StatusTypeDef status)
+{
+    uint32_t err = HAL_I2C_GetError(&hi2c1);
+    printf("BMM350v2: %s -> HAL status %d, ErrorCode 0x%02lX", what, (int)status, (unsigned long)err);
+    if (err & HAL_I2C_ERROR_AF)      printf(" [AF: geen ACK, niets op dit adres]");
+    if (err & HAL_I2C_ERROR_BERR)    printf(" [BERR: busfout]");
+    if (err & HAL_I2C_ERROR_ARLO)    printf(" [ARLO: arbitration lost]");
+    if (err & HAL_I2C_ERROR_TIMEOUT) printf(" [TIMEOUT: bus hangt, check pull-ups/voeding]");
+    printf("\n");
+}
+
+void BMM350v2_ScanBus(void)
+{
+    printf("BMM350v2: I2C1-scan van 0x08 t/m 0x77...\n");
+    uint8_t found = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr << 1), 2, 5) == HAL_OK) {
+            printf("BMM350v2:   gevonden op 0x%02X\n", addr);
+            found++;
+        }
+    }
+    if (found == 0) {
+        printf("BMM350v2:   niets gevonden. Check voeding (VDD/VDDIO), GND, "
+               "pull-ups op PB8/PB9 en of SDA/SCL niet verwisseld zijn.\n");
+    }
 }
 
 uint8_t BMM350v2_IsDataReady(void)
@@ -87,16 +128,53 @@ uint8_t BMM350v2_IsDataReady(void)
 BMM350v2_Status BMM350v2_Init(void)
 {
     uint8_t chip_id = 0;
+    HAL_StatusTypeDef last_status = HAL_ERROR;
+    uint8_t addr_found = 0;
 
-    if (BMM350v2_ReadReg(REG_CHIP_ID, &chip_id, 1) != HAL_OK) {
-        printf("BMM350v2: I2C-fout bij lezen chip-ID\n");
+    /* De BMM350 heeft na power-on ~3ms nodig voor hij op I2C antwoordt; ruim
+     * nemen, want de voedingsrail van het board komt mogelijk later op gang. */
+    HAL_Delay(20);
+
+    /* Soft reset via het CMD-register, zodat we niet afhangen van in welke
+     * toestand de chip stond na een warme reset van de MCU. */
+    (void)BMM350v2_WriteReg(REG_CMD, CMD_SOFTRESET);
+    HAL_Delay(24); /* datasheet: soft reset duurt max. 24ms */
+
+    /* Probeer alle 4 mogelijke adressen; welke het is hangt af van de SDO/CSB-
+     * bedrading op dit board. */
+    for (uint8_t i = 0; i < sizeof(bmm350_addr_candidates); i++) {
+        bmm350_addr7 = bmm350_addr_candidates[i];
+        last_status = BMM350v2_ReadReg(REG_CHIP_ID, &chip_id, 1);
+        if (last_status == HAL_OK) {
+            printf("BMM350v2: antwoord op adres 0x%02X, chip-ID 0x%02X\n", bmm350_addr7, chip_id);
+            addr_found = 1;
+            break;
+        }
+    }
+
+    if (!addr_found) {
+        /* Scan + checklist maar 1x printen, anders spamt de retry-loop de terminal vol. */
+        static uint8_t diag_printed = 0;
+        if (!diag_printed) {
+            diag_printed = 1;
+            BMM350v2_PrintI2CError("geen antwoord op 0x14/0x15/0x16/0x17", last_status);
+            BMM350v2_ScanBus();
+            printf("BMM350v2: de BMM350 kan ALLEEN I2C/I3C (geen SPI), dus als hij\n"
+                   "          hier niet antwoordt is het voeding of bedrading of de chip zelf:\n"
+                   "          1) meet VDD en VDDIO RECHTSTREEKS op de BMM350 (niet op de regulator)\n"
+                   "          2) meet doorverbinding PB8->SCL-pad en PB9->SDA-pad van de chip\n"
+                   "          3) meet GND-pad van de chip naar massa\n"
+                   "          Antwoordt er wel iets anders in de scan hierboven, dan is de bus zelf OK.\n");
+        }
         return BMM350V2_ERR_I2C;
     }
+
     if (chip_id != CHIP_ID_EXPECTED) {
         printf("BMM350v2: verkeerde chip-ID (0x%02X, verwacht 0x%02X)\n", chip_id, CHIP_ID_EXPECTED);
+        BMM350v2_ScanBus();
         return BMM350V2_ERR_ID;
     }
-    printf("BMM350v2: chip-ID OK (0x%02X)\n", chip_id);
+    printf("BMM350v2: chip-ID OK (0x%02X) op adres 0x%02X\n", chip_id, bmm350_addr7);
 
     uint8_t config_ok = 1;
     /* ODR 50Hz, gemiddelde van 4 metingen (zelfde instelling als datasheet-
@@ -111,7 +189,7 @@ BMM350v2_Status BMM350v2_Init(void)
     /* van suspend naar normal mode */
     config_ok &= (BMM350v2_WriteReg(REG_PMU_CMD, 0x01) == HAL_OK);
     if (!config_ok) {
-        printf("BMM350v2: I2C-fout bij configureren\n");
+        BMM350v2_PrintI2CError("I2C-fout bij configureren", HAL_ERROR);
         return BMM350V2_ERR_I2C;
     }
     HAL_Delay(5); /* PMU-commando's hebben even tijd nodig om te verwerken */

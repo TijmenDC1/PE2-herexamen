@@ -6,18 +6,27 @@
  *
  * Inladen en uitvoeren van een vluchplan bestand van de SD kaart.
  *
- * Bestandsformaat (één commando per lijn):
- *   RelativeHeight <meter> end
- *   AbsoluteHeight <meter> end
- *   Hover          <ms>    end
- *   Throttle       <procent> <ms> end
- *   Move           <x> <y> <z> end
+ * Bestandsformaat (één commando per lijn, regels met # zijn commentaar):
+ *   RelativeHeight <meter>
+ *   AbsoluteHeight <meter>
+ *   Hover          <ms>
+ *   Throttle       <procent 0-100> <ms>
+ *   Move           <x> <y> <z>
+ *   Left           <ms>
+ *   Right          <ms>
+ *   Land
  *
  * Voorbeeld vluchtplan.txt:
- *   RelativeHeight 10 end
- *   Hover 3000 end
- *   Move 1.0 0.0 0.0 end
- *   AbsoluteHeight 0 end
+ *   # voorzichtige testvlucht
+ *   Throttle 30 2000
+ *   Throttle 40 3000
+ *   Left 1000
+ *   Right 1000
+ *   Land
+ *
+ * Let op: een eerdere versie van dit commentaar zette "end" achter elke regel.
+ * De parser heeft dat nooit nodig gehad en negeert extra tokens; de schrijver
+ * in flightplan_io.c zet het er dus ook niet bij.
  */
 
 #ifndef INC_FLIGHTPLAN_H_
@@ -54,8 +63,17 @@ typedef struct {
     uint16_t    current;    // huidige uitvoeringsindex
 } FlightPlan_t;
 
+/* Zet één tekstregel om naar een FlightCmd_t.
+ * Retourneert 1 bij een geldig commando, 0 bij commentaar, een lege regel of
+ * een onbekend commando (dat wordt dan overgeslagen).
+ * Wordt ook gebruikt door flightplan_io.c, zodat schrijven en lezen precies
+ * dezelfde commandonamen hanteren. */
+uint8_t FlightPlan_ParseLine(const char *line, FlightCmd_t *cmd);
+
 /* Laad het volledige vluchtplan van de SD kaart.
- * Retourneert het aantal geladen commando's, of -1 bij een fout. */
+ * Retourneert het aantal geladen commando's, of -1 bij een fout.
+ * Dit is de tekst-only variant. Voor het formaatonafhankelijke pad, zie
+ * FlightPlanIO_Load() in flightplan_io.h. */
 int FlightPlan_Load(FlightPlan_t *plan, const char *filename);
 
 /* Geeft 1 als er nog commando's zijn om uit te voeren. */
