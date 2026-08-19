@@ -4,37 +4,46 @@
  *  Created on: 15 jul 2026
  *      Author: tijme
  *
- * Inladen en uitvoeren van een vluchplan bestand van de SD kaart.
+
+ * flightplan.h
+ vluchtplan: de types, en alles om een plan van de SD-kaart lezen.
+ * Wegschrijven staat in flightplan_write.h.
+
+ * Bestandsformaat op de kaart (gewone tekst, 1 commando per regel):
  *
- * Bestandsformaat (één commando per lijn, regels met # zijn commentaar):
- *   RelativeHeight <meter>
- *   AbsoluteHeight <meter>
- *   Hover          <ms>
- *   Throttle       <procent 0-100> <ms>
- *   Move           <x> <y> <z>
- *   Left           <ms>
- *   Right          <ms>
- *   Land
- *
- * Voorbeeld vluchtplan.txt:
- *   # voorzichtige testvlucht
- *   Throttle 30 2000
- *   Throttle 40 3000
- *   Left 1000
- *   Right 1000
- *   Land
- *
- * Let op: een eerdere versie van dit commentaar zette "end" achter elke regel.
- * De parser heeft dat nooit nodig gehad en negeert extra tokens; de schrijver
- * in flightplan_io.c zet het er dus ook niet bij.
+ *   # regels met een # zijn commentaar
+ *   Throttle 30 2000      procent 0-100, daarna de duur in ms
+ *   Hover 1500            duur in ms, houdt de huidige throttle aan
+ *   Left 1000             duur in ms, kantelt LEFT_RIGHT_TILT_DEG naar links
+ *   Right 1000            idem naar rechts
+ *   Land                  bouwt de throttle af en zet de motoren uit
+ *   RelativeHeight 1.5    meter, wordt geparsed maar nog niet uitgevoerd
+ *   AbsoluteHeight 10     meter, idem (barometer nodig)
+ *   Move 1 2 3            x y z, idem (GPS nodig)
  */
 
-#ifndef INC_FLIGHTPLAN_H_
-#define INC_FLIGHTPLAN_H_
+#ifndef FLIGHTPLAN_H
+#define FLIGHTPLAN_H
 
+#include "fc_config.h"
 #include <stdint.h>
 
-#define FLIGHTPLAN_MAX_CMDS   64    // maximaal aantal commando's in één vluchtplan
+#ifndef FLIGHTPLAN_MAX_CMDS
+#define FLIGHTPLAN_MAX_CMDS     32          /* commando's die in één plan passen */
+#endif
+#ifndef FLIGHTPLAN_FILE_MAX
+#define FLIGHTPLAN_FILE_MAX     4096        /* grootte van de gedeelde werkbuffer */
+#endif
+#ifndef FLIGHTPLAN_ACTIVE_FILE
+#define FLIGHTPLAN_ACTIVE_FILE  "plan.txt"  /* het plan dat flightrun.c uitvoert */
+#endif
+
+#define FLIGHTPLAN_LINE_MAX     96          /* langste regel die we aankunnen */
+
+#ifndef FLIGHTPLAN_MAX_DUR_MS
+#define FLIGHTPLAN_MAX_DUR_MS   300000.0f   /* 5 min: alles daarboven is een typfout
+                                             * of een kapot bestand, en wordt afgekeurd */
+#endif
 
 typedef enum {
     CMD_UNKNOWN = 0,
@@ -45,45 +54,72 @@ typedef enum {
     CMD_MOVE,
     CMD_LEFT,
     CMD_RIGHT,
-    CMD_LAND,
+    CMD_LAND
 } FlightCmdType_t;
+
 typedef struct {
     FlightCmdType_t type;
-    float param[3];   // param[0..2] afhankelijk van commando
-                      // RelativeHeight : param[0] = meter
-                      // AbsoluteHeight : param[0] = meter
-                      // Hover          : param[0] = ms
-                      // Throttle       : param[0] = procent, param[1] = ms
-                      // Move           : param[0]=x  param[1]=y  param[2]=z
+    float           param[3];   /* max 3, bij Move is dat x, y, z */
 } FlightCmd_t;
 
 typedef struct {
     FlightCmd_t cmds[FLIGHTPLAN_MAX_CMDS];
-    uint16_t    count;      // aantal geladen commando's
-    uint16_t    current;    // huidige uitvoeringsindex
+    uint16_t    count;          /* hoeveel commando's er in staan */
+    uint16_t    current;        /* welk commando aan de beurt is */
 } FlightPlan_t;
 
-/* Zet één tekstregel om naar een FlightCmd_t.
- * Retourneert 1 bij een geldig commando, 0 bij commentaar, een lege regel of
- * een onbekend commando (dat wordt dan overgeslagen).
- * Wordt ook gebruikt door flightplan_io.c, zodat schrijven en lezen precies
- * dezelfde commandonamen hanteren. */
+/* Handig om het aantal commando's van je eigen array in main.c mee te geven:
+ *   FlightPlan_Save(mijn_plan, FLIGHTPLAN_AANTAL(mijn_plan), FLIGHTPLAN_ACTIVE_FILE); */
+#define FLIGHTPLAN_AANTAL(a)    ((uint16_t)(sizeof(a) / sizeof((a)[0])))
+
+typedef enum {
+    FP_OK = 0,
+    FP_ERR_SD,        /* mounten, openen, lezen of schrijven mislukt */
+    FP_ERR_EMPTY,     /* geen enkel geldig commando in het bestand */
+    FP_ERR_TOO_BIG,   /* meer commando's of bytes dan er passen */
+    FP_ERR_INVALID    /* afgekeurd door de validatie, of anders teruggelezen */
+} FP_Status_t;
+
+/* Het plan dat nu in RAM staat. Eén exemplaar voor het hele project: er vliegt
+ * er toch maar één tegelijk, en een FlightPlan_t is een halve kilobyte. */
+extern FlightPlan_t g_flightplan;
+
+/* Gedeelde werkbuffer voor bestandsinhoud, ook gebruikt door flightplan_write.c. */
+extern uint8_t g_fp_buf[FLIGHTPLAN_FILE_MAX];
+
+/* --- lezen (de kaart moet gemount zijn) --------------------------------- */
+
+/* Zet één tekstregel om naar een FlightCmd_t. 1 = gelukt, 0 = overgeslagen. */
 uint8_t FlightPlan_ParseLine(const char *line, FlightCmd_t *cmd);
 
-/* Laad het volledige vluchtplan van de SD kaart.
- * Retourneert het aantal geladen commando's, of -1 bij een fout.
- * Dit is de tekst-only variant. Voor het formaatonafhankelijke pad, zie
- * FlightPlanIO_Load() in flightplan_io.h. */
-int FlightPlan_Load(FlightPlan_t *plan, const char *filename);
+/* Leest het bestand van de kaart en parset het naar g_flightplan. */
+FP_Status_t FlightPlan_Load(const char *filename);
 
-/* Geeft 1 als er nog commando's zijn om uit te voeren. */
-uint8_t FlightPlan_HasNext(FlightPlan_t *plan);
+/* --- alles-in-één voor main.c (mount en unmount zitten erin) ------------- */
 
-/* Geeft een pointer naar het volgende commando en schuift de index op.
- * Retourneert NULL als het plan afgelopen is. */
-FlightCmd_t *FlightPlan_Next(FlightPlan_t *plan);
+/* Mount, print eventueel de ruwe bytes, laadt, print genummerd en valideert. */
+FP_Status_t FlightPlan_Show(const char *filename, uint8_t toon_ruw);
 
-/* Reset de uitvoeringsindex zodat het plan opnieuw begint. */
-void FlightPlan_Reset(FlightPlan_t *plan);
+/* --- doorlopen tijdens de vlucht ---------------------------------------- */
 
-#endif /* INC_FLIGHTPLAN_H_ */
+void         FlightPlan_Reset  (FlightPlan_t *plan);
+uint8_t      FlightPlan_HasNext(FlightPlan_t *plan);
+FlightCmd_t *FlightPlan_Next   (FlightPlan_t *plan);
+
+/* --- tonen en controleren ----------------------------------------------- */
+
+const char *FP_StatusStr       (FP_Status_t s);
+const char *FlightPlan_CmdName (FlightCmdType_t t);
+uint8_t     FlightPlan_CmdParams(FlightCmdType_t t);
+
+/* Zet een commando om naar exact de tekstregel die ook op de kaart komt. */
+uint16_t FlightPlan_FormatCmd(const FlightCmd_t *cmd, char *out, uint16_t out_len);
+
+void     FlightPlan_Print(const FlightCmd_t *cmds, uint16_t count, const char *titel);
+uint32_t FlightPlan_TotalDurationMs(const FlightCmd_t *cmds, uint16_t count);
+
+/* err krijgt de reden van afkeuring, mag NULL zijn. */
+FP_Status_t FlightPlan_Validate(const FlightCmd_t *cmds, uint16_t count,
+                                char *err, uint16_t err_len);
+
+#endif /* FLIGHTPLAN_H */
