@@ -23,14 +23,14 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
-#include "BMP384.h"
+//#include "BMP384.h"
 //#include "BMM350.h"
 //#include "BMI330.h"
 //#include "pid_regulator.h"
 #include "Flightrun.h"
 #include "sdcard.h"
-#include "flightplan_io.h"
-#include "flightplan_tool.h"
+#include "flightplan.h"         /* lezen wat er op een bestand staat  */
+#include "flightplan_write.h"   /* een bestand maken en beschrijven   */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -69,7 +69,7 @@ UART_HandleTypeDef huart7;
 UART_HandleTypeDef huart8;
 
 /* USER CODE BEGIN PV */
-BMP384_Calib calibData;
+//BMP384_Calib calibData;
 /*
 PID_Handle_t struct_PidRateRoll;
 PID_Handle_t struct_PidRatePitch;
@@ -104,7 +104,7 @@ static void MX_TIM4_Init(void);
 static void MX_UART7_Init(void);
 static void MX_UART8_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void schrijf_vluchtplan(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -115,18 +115,17 @@ int g_new_pressure_data = 0;
 /* ==========================================================================
  * Vluchtplan: schrijven, uitlezen, vliegen
  *
- * De plannen zelf staan in flightplan_tool.c als FlightCmd_t-arrays.
- * Zet deze drie vlaggen naar wat je nu wil doen.
+ * Het plan zelf staat hieronder als FlightCmd_t-array. Zet de drie vlaggen
+ * naar wat je nu wil doen.
  * ========================================================================== */
 
-/* 1) SCHRIJVEN. Zet de hardgecodeerde plannen op de SD-kaart. Nodig omdat dit
- *    bordje geen SD-lezer op de PC heeft. Na de eerste geslaagde flash+run mag
- *    dit op 0, anders wordt de kaart bij elke boot overschreven. */
+/* 1) SCHRIJVEN. Zet het plan hieronder op de SD-kaart. Na de eerste geslaagde
+ *    flash+run mag dit op 0, anders wordt de kaart bij elke boot overschreven. */
 #define WRITE_FLIGHTPLAN_TO_SD  1
 
-/* 2) UITLEZEN. Leest het actieve plan terug van de kaart en print het genummerd
- *    over UART8, met validatie. Zo zie je precies wat de drone gaat doen.
- *    Laat dit gerust op 1 staan, het kost alleen wat opstarttijd. */
+/* 2) UITLEZEN. Leest het plan terug van de kaart en print het genummerd over
+ *    UART8, met validatie. Zo zie je precies wat de drone gaat doen. Laat dit
+ *    gerust op 1 staan, het kost alleen wat opstarttijd. */
 #define DUMP_FLIGHTPLAN_FROM_SD 1
 
 /* 3) VLIEGEN. Op 0 doet het bord alleen schrijven en uitlezen, en blijven de
@@ -138,6 +137,49 @@ int g_new_pressure_data = 0;
 /* Print bij het uitlezen ook de ruwe bytes van het bestand, zodat je ziet dat
  * er echt iets op de kaart staat en niet alleen in RAM. */
 #define DUMP_FLIGHTPLAN_RAW     1
+
+/* --------------------------------------------------------------------------
+ * Het vluchtplan
+ *
+ * Throttle <procent 0-100> <ms>   0 % = THROTTLE_MIN, 100 % = THROTTLE_MAX
+ * Hover    <ms>                   houdt de huidige throttle aan
+ * Left     <ms>                   kantelt LEFT_RIGHT_TILT_DEG naar links
+ * Right    <ms>                   idem naar rechts
+ * Land                            bouwt de throttle af en zet de motoren uit
+ *
+ * RelativeHeight / AbsoluteHeight / Move worden wel geschreven en ingelezen,
+ * maar flightcontrol.c slaat ze nog over: die hebben de barometer en GPS nodig.
+ *
+ * TEST DIT EERST ZONDER PROPELLERS, of met het frame vastgezet op een
+ * teststaaf. FlightControl_Init() kalibreert de gyro en het level: het frame
+ * moet dan stil en waterpas liggen (volg de printf's over UART8).
+ * -------------------------------------------------------------------------- */
+static const FlightCmd_t mijn_plan[] = {
+    { CMD_THROTTLE, { 30.0f, 2000.0f, 0.0f } },   /* rustig aanlopen            */
+    { CMD_THROTTLE, { 40.0f, 3000.0f, 0.0f } },   /* ~THROTTLE_BASE             */
+    { CMD_LEFT,     { 1000.0f, 0.0f, 0.0f } },    /* kantelrichting controleren */
+    { CMD_RIGHT,    { 1000.0f, 0.0f, 0.0f } },
+    { CMD_THROTTLE, { 35.0f, 1500.0f, 0.0f } },   /* rustig voor de landing     */
+    { CMD_LAND,     { 0.0f, 0.0f, 0.0f } },
+};
+
+/* Maakt het bestand aan op de kaart en schrijft het plan hierboven erin.
+ * FlightPlan_Save valideert eerst, dus een fout plan raakt de kaart niet, en
+ * leest daarna byte voor byte terug of er echt staat wat we bedoelden.
+ *
+ * Wil je meerdere plannen op de kaart, zet er dan een tweede array naast en
+ * roep FlightPlan_Save nog een keer aan met een andere bestandsnaam. Houd die
+ * naam op 8.3 (max 8 tekens voor de punt): met de standaardinstelling van
+ * FATFS staan lange bestandsnamen uit. */
+static void schrijf_vluchtplan(void)
+{
+    if (SDCard_Mount() != SDCARD_OK) {
+        printf("kon de SD-kaart niet mounten, er is niets geschreven\n");
+        return;
+    }
+    FlightPlan_Save(mijn_plan, FLIGHTPLAN_AANTAL(mijn_plan), FLIGHTPLAN_ACTIVE_FILE);
+    SDCard_Unmount();
+}
 
 int _write(int file, char *ptr, int len) {
 	for(int i = 0; i < len; i++){
@@ -230,26 +272,23 @@ int main(void)
    * bord daarna vastloopt of in een failsafe belandt. */
   setvbuf(stdout, NULL, _IONBF, 0);
 
-  BMP384_Init(&calibData);
+  //BMP384_Init(&calibData);
 
   printf("\n\n===== opgestart, vluchtplan-test =====\n");
 
 #if WRITE_FLIGHTPLAN_TO_SD
-  /* SCHRIJVEN: hardgecodeerde plannen -> SD-kaart, met validatie en terugleescontrole */
+  /* SCHRIJVEN: het plan uit mijn_plan[] -> SD-kaart, met validatie en
+   * terugleescontrole. Zie schrijf_vluchtplan() hierboven. */
   printf("\n[1] SCHRIJVEN\n");
-  FlightPlanTool_ListBuiltin();
-  FlightPlanTool_WriteAll();
+  schrijf_vluchtplan();
 #endif
 
 #if DUMP_FLIGHTPLAN_FROM_SD
-#if DUMP_FLIGHTPLAN_RAW
-  /* de ruwe bytes zoals ze op de kaart staan */
-  printf("\n[2] RUWE INHOUD VAN DE KAART\n");
-  FlightPlanTool_DumpRaw(FLIGHTPLAN_ACTIVE_FILE);
-#endif
-  /* UITLEZEN: SD-kaart -> RAM -> genummerd over UART8 */
-  printf("\n[3] UITLEZEN EN CONTROLEREN\n");
-  FlightPlanTool_Dump(FLIGHTPLAN_ACTIVE_FILE, NULL);
+  /* UITLEZEN: SD-kaart -> RAM -> genummerd over UART8, met validatie. Staat
+   * DUMP_FLIGHTPLAN_RAW op 1, dan komen ook de ruwe bytes van het bestand
+   * voorbij. FlightPlan_Show mount en unmount zelf. */
+  printf("\n[2] UITLEZEN EN CONTROLEREN\n");
+  FlightPlan_Show(FLIGHTPLAN_ACTIVE_FILE, DUMP_FLIGHTPLAN_RAW);
 #endif
 
 #if RUN_FLIGHTPLAN
@@ -267,14 +306,14 @@ int main(void)
 	  	//	  float hoogte = BMP384_CalculateAltitude(pressure_pa);
 	  		//  float temp = BMP384_GetTemp(&calibData);
 	  		  //printf("BMP284:\r\n De druk(pa) = %f\nDe hoogte(m) = %f, De temp = %f\n", pressure_pa, hoogte, temp);
-	  if(g_new_pressure_data == 1){
-		  float pressure_pa = BMP384_ReadData(&calibData); // in pascal
+	  //if(g_new_pressure_data == 1){
+		//  float pressure_pa = BMP384_ReadData(&calibData); // in pascal
 		  //float hoogte = BMP384_CalculateAltitude(pressure_pa);
 		  //float temp = BMP384_GetTemp(&calibData);
 		  //printf("BMP284:\r\n De druk(pa) = %f\nDe hoogte(m) = %f, De temp = %f\n", pressure_pa, hoogte, temp);
-		  printf("BMP284:\r\n De druk(pa) = %f\n", pressure_pa);
-		  g_new_pressure_data = 0;
-	  }
+		 // printf("BMP284:\r\n De druk(pa) = %f\n", pressure_pa);
+		//  g_new_pressure_data = 0;
+	  //}
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
