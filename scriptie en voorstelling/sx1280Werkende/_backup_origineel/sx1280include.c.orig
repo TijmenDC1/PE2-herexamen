@@ -1,0 +1,3059 @@
+#include "sx1280include.h"
+#include "main.h"
+#include "stdio.h"
+
+extern SPI_HandleTypeDef hspi2;
+extern TIM_HandleTypeDef htim3;
+extern volatile uint8_t fhss_index;
+extern volatile uint8_t is_synchronized;
+extern uint8_t fhss_sequence[]; // Array uit main.c
+
+/* --- Toestand van de link --- */
+volatile uint8_t  elrs_link_state = ELRS_STATE_SEARCHING;
+volatile uint8_t  elrs_nonce      = 0;
+volatile uint8_t  elrs_do_hop     = 0;
+volatile uint32_t elrs_preamble_count = 0;
+volatile uint32_t elrs_packet_count   = 0;
+volatile uint16_t elrs_channels[4] = {0};
+
+/* Bij het opstarten is er nog niets ontvangen, dus staat de failsafe aan. */
+volatile uint8_t  elrs_failsafe = 1;
+volatile uint8_t  elrs_lq       = 0;
+
+/* Zet de kanalen op een stand waar niets van gebeurt. Wordt aangeroepen bij
+ * het verliezen van de verbinding en bij het opstarten. */
+static void ELRS_ZetFailsafe(void)
+{
+    for (int i = 0; i < 4; i++) elrs_channels[i] = ELRS_FAILSAFE_MIDDEN;
+    elrs_channels[ELRS_FAILSAFE_GAS_KANAAL] = ELRS_FAILSAFE_GAS_WAARDE;
+    elrs_failsafe = 1;
+}
+
+uint8_t ELRS_LinkOK(void)
+{
+    return (elrs_link_state == ELRS_STATE_LOCKED) && !elrs_failsafe;
+}
+
+/* Acquisitie zonder sync: welke van de vier kandidaat-indexen proberen we,
+ * is die al bewezen, en hoeveel geldige pakketten hebben we sindsdien? */
+volatile uint8_t elrs_acq_poging    = 0;
+volatile uint8_t elrs_acq_bevestigd = 0;
+volatile uint8_t elrs_acq_teller    = 0;
+
+/* Ankerpunt voor de FHSS-index: bij de lock leggen we vast welke index bij
+ * welke nonce hoorde. Daarna rekenen we de index elke keer opnieuw uit in
+ * plaats van hem op te hogen. Zie ELRS_HandleHop voor het waarom. */
+volatile uint8_t  elrs_anker_nonce = 0;
+volatile uint16_t elrs_anker_index = 0;
+
+/* Doorlopende pakkettelling, 32 bits. De nonce is maar 8 bits en wrapt dus
+ * elke 256 pakketten; bij 250 Hz is dat al na 1 seconde. Voor de CRC is dat
+ * prima, maar je kan er geen index mee uitrekenen over langere tijd: een
+ * sprong van 320 pakketten leest als 64. Deze teller heeft dat probleem niet. */
+volatile uint32_t elrs_ticks       = 0;
+volatile uint32_t elrs_anker_ticks = 0;
+
+static uint32_t last_packet_time = 0;
+static uint32_t print_teller = 0;
+
+/* ==========================================================================
+ *  Laag niveau SPI
+ * ========================================================================== */
+
+uint8_t SX1280_BUSY(void)
+{
+    /* Bewust GEEN HAL_GetTick() als timeout: deze functie wordt nu ook vanuit
+     * de TIM3-interrupt aangeroepen om te hoppen. Heeft TIM3 een hogere
+     * prioriteit dan SysTick, dan loopt de tick daar niet door en zou de
+     * timeout nooit aflopen. Een simpele lusteller heeft dat probleem niet.
+     *
+     * 2 miljoen iteraties is bij 216 MHz ruwweg 30 ms. BUSY staat normaal
+     * hooguit enkele honderden microseconden hoog. */
+    uint32_t wacht = 2000000u;
+
+    while (HAL_GPIO_ReadPin(SX1280_Bussy_GPIO_Port, SX1280_Bussy_Pin) == GPIO_PIN_SET) {
+        if (--wacht == 0) return 1;
+    }
+    return 0;
+}
+
+/* Staat er op dit moment een SPI-transactie open? De timer-interrupt gebruikt
+ * dit om te weten of hij zelf mag hoppen of dat hij het moet doorgeven aan de
+ * main-loop. Zonder deze vlag zou een hop midden in een lopende transactie
+ * vallen en die verminken. */
+volatile uint8_t elrs_spi_bezig = 0;
+
+void SX1280_Select(void)
+{
+    elrs_spi_bezig = 1;
+	__asm__ volatile ("NOP \n NOP \n NOP");
+    HAL_GPIO_WritePin(SX1280_CS_GPIO_Port, SX1280_CS_Pin, 0);
+    __asm__ volatile ("NOP \n NOP \n NOP");
+}
+
+void SX1280_Deselect(void)
+{
+	__asm__ volatile ("NOP \n NOP \n NOP");
+    HAL_GPIO_WritePin(SX1280_CS_GPIO_Port, SX1280_CS_Pin, GPIO_PIN_SET);
+    __asm__ volatile ("NOP \n NOP \n NOP");
+    elrs_spi_bezig = 0;
+}
+
+/* Stuurt een commando met payload, zonder antwoord te lezen. */
+static void SX1280_Cmd(uint8_t *buf, uint8_t len)
+{
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_Transmit(&hspi2, buf, len, HAL_MAX_DELAY);
+    SX1280_Deselect();
+    SX1280_BUSY();
+}
+
+int8_t SX1280_GetRssiInst(void)
+{
+    uint8_t tx_buf[3] = {SX1280_GETRSSIINST, 0x00, 0x00};
+    uint8_t rx_buf[3] = {0};
+
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_buf, rx_buf, 3, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    return -(rx_buf[2] / 2);
+}
+
+/* GetPacketStatus in LoRa-modus (datasheet 11.8.2):
+ *   byte 0 = opcode, byte 1 = status, byte 2 = rssiSync, byte 3 = snr
+ *   RSSI [dBm] = -rssiSync / 2
+ *   SNR  [dB]  = snr / 4   (alleen negatieve waarden zijn betekenisvol) */
+void SX1280_GetPacketStatus(int8_t *rssi, int8_t *snr)
+{
+    uint8_t tx_buf[7] = {SX1280_GETPACKETSTATUS, 0, 0, 0, 0, 0, 0};
+    uint8_t rx_buf[7] = {0};
+
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_buf, rx_buf, 7, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    if (rssi) *rssi = -(int8_t)(rx_buf[2] / 2);
+    if (snr)  *snr  = ((int8_t)rx_buf[3]) / 4;
+}
+
+void SX1280_getstatus(void)
+{
+    uint8_t cmd[2] = {SX1280_GETSTATUS, 0x00};
+    uint8_t receive[2];
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, cmd, receive, 2, HAL_MAX_DELAY);
+    SX1280_Deselect();
+}
+
+/* --------------------------------------------------------------------------
+ *  Statusbyte uitlezen en uitschrijven
+ * --------------------------------------------------------------------------
+ *  Het antwoord op GetStatus bevat twee velden (SX1280_Regs.h van ELRS):
+ *      bits 7:5  circuit mode   (2=STDBY_RC, 3=STDBY_XOSC, 4=FS, 5=RX, 6=TX)
+ *      bits 4:2  command status (1=ok, 2=data beschikbaar, 3=timeout,
+ *                                4=verwerkingsfout, 5=uitvoeren mislukt)
+ *
+ *  SetModulationParams en SetPacketParams kan je niet teruglezen, maar als de
+ *  chip een van je commando's WEIGERT, dan staat dat hier. Een 4 of 5 in het
+ *  commandostatusveld betekent dat een parameter niet geaccepteerd is, en dan
+ *  staat de radio dus anders ingesteld dan je denkt.
+ * -------------------------------------------------------------------------- */
+uint8_t SX1280_GetStatusByte(void)
+{
+    uint8_t cmd[2] = {SX1280_GETSTATUS, 0x00};
+    uint8_t rx[2]  = {0};
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, cmd, rx, 2, HAL_MAX_DELAY);
+    SX1280_Deselect();
+    /* Bij GetStatus staat het statusbyte al in het eerste antwoordbyte. */
+    return rx[0] ? rx[0] : rx[1];
+}
+
+void SX1280_PrintStatus(const char *label)
+{
+    uint8_t st = SX1280_GetStatusByte();
+    uint8_t mode = (uint8_t)((st >> 5) & 0x07);
+    uint8_t cmd  = (uint8_t)((st >> 2) & 0x07);
+
+    static const char *modes[8] = {
+        "?", "?", "STDBY_RC", "STDBY_XOSC", "FS", "RX", "TX", "?"
+    };
+    static const char *cmds[8] = {
+        "-", "ok", "data beschikbaar", "timeout",
+        "VERWERKINGSFOUT", "UITVOEREN MISLUKT", "tx klaar", "-"
+    };
+
+    printf("status %-14s : 0x%02X  mode=%s  commando=%s%s\n",
+           label, st, modes[mode], cmds[cmd],
+           (cmd == 4 || cmd == 5) ? "   <<< DE CHIP WEIGERT EEN COMMANDO" : "");
+}
+
+void SX1280_Reset(void)
+{
+    HAL_GPIO_WritePin(SX1280_nRST_GPIO_Port, SX1280_nRST_Pin, 0);
+    HAL_Delay(20);
+    __asm__ volatile ("NOP \n NOP \n NOP");
+    HAL_GPIO_WritePin(SX1280_nRST_GPIO_Port, SX1280_nRST_Pin, 1);
+    HAL_Delay(20);
+    SX1280_BUSY();
+
+    SX1280_getstatus();
+    SX1280_getstatus();
+}
+
+void SX1280_WriteRegister(uint16_t address, uint8_t value)
+{
+    uint8_t tx_buf[4] = {SX1280_WRITEREGISTER, (uint8_t)(address >> 8), (uint8_t)(address & 0xFF), value};
+    uint8_t rx_buf[4] = {0};
+
+    if(SX1280_BUSY() == 1) return;
+
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_buf, rx_buf, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+}
+
+uint8_t SX1280_ReadRegister(uint16_t address)
+{
+    uint8_t tx_buf[5] = {SX1280_READREGISTER, (uint8_t)(address >> 8), (uint8_t)(address & 0xFF), 0x00, 0x00};
+    uint8_t rx_buf[5] = {0};
+
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_buf, rx_buf, 5, HAL_MAX_DELAY);
+    SX1280_Deselect();
+    return rx_buf[4];
+}
+
+void SX1280_ReadBuffer(uint8_t offset, uint8_t *data, uint8_t size)
+{
+	uint8_t NOP = 0x00;
+	uint8_t READBUFFER = SX1280_READBUFFER;
+	SX1280_BUSY();
+    SX1280_Select();
+
+    HAL_SPI_Transmit(&hspi2, &READBUFFER, 1, HAL_MAX_DELAY);
+    HAL_SPI_Transmit(&hspi2, &offset, 1, HAL_MAX_DELAY);
+    HAL_SPI_Transmit(&hspi2, &NOP, 1, HAL_MAX_DELAY);
+    HAL_SPI_Receive(&hspi2, data, size, HAL_MAX_DELAY);
+    SX1280_Deselect();
+}
+
+void SX1280_WriteBufferArray(uint8_t offset, uint8_t *data, uint8_t size)
+{
+    uint8_t hdr[2] = {SX1280_WRITEBUFFER, offset};
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_Transmit(&hspi2, hdr, 2, HAL_MAX_DELAY);
+    HAL_SPI_Transmit(&hspi2, data, size, HAL_MAX_DELAY);
+    SX1280_Deselect();
+}
+
+void SX1280_SetRfFrequency(uint32_t frequency)
+{
+    /* Vaste correctie voor een kristal dat er naast zit (zie de sweep). */
+    frequency = (uint32_t)((int32_t)frequency + (int32_t)ELRS_FREQ_CORRECTIE_HZ);
+
+    uint32_t rfwaarde = (uint32_t)(((uint64_t)frequency << 18) / 52000000);
+    uint8_t buf[4] = {SX1280_SETRFFREQUENCY, (uint8_t)(rfwaarde >> 16), (uint8_t)(rfwaarde >> 8), (uint8_t)(rfwaarde & 0xFF)};
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_Transmit(&hspi2, buf, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+}
+
+void SX1280_SetRx(void)
+{
+    /* periodBase 0x02 = 1 ms, periodBaseCount 0xFFFF = Rx Continuous */
+    uint8_t buf[4] = {SX1280_SETRX, 0x02, 0xFF, 0xFF};
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_Transmit(&hspi2, buf, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+    SX1280_BUSY();
+}
+
+void SX1280_SetTxParams(int8_t power, uint8_t rampTime)
+{
+    /* power register = dBm + 18, geldig bereik -18..+13 dBm */
+    if (power < -18) power = -18;
+    if (power >  13) power =  13;
+    uint8_t buf[3] = {SX1280_SETTXPARAMS, (uint8_t)(power + 18), rampTime};
+    SX1280_Cmd(buf, 3);
+}
+
+void SX1280_SetTxContinuousWave(void)
+{
+    uint8_t buf[1] = {SX1280_SETTXCONTINUOUSWAVE};
+    SX1280_Cmd(buf, 1);
+}
+
+void SX1280_SetDioIrqParams(void)
+{
+    /* PreambleDetected zit erbij zodat je in de debugmodus kan zien of er iets
+     * op de frequentie staat, ook als het pakket niet compleet wordt.
+     *
+     * In normaal bedrijf kost dat wel wat: de polling ziet die vlag, wist
+     * daarna ALLE IRQ-vlaggen en kan zo een RxDone wegvegen die er net
+     * tussendoor kwam. Bij 250 Hz met een pakket elke 4 ms is dat geen
+     * theoretisch risico meer. Vandaar dat hij alleen in de debugmodi aan
+     * staat. */
+    uint16_t irqMask  = SX1280_IRQ_RX_DONE | SX1280_IRQ_RX_TX_TIMEOUT
+                      | SX1280_IRQ_CRC_ERROR
+#if ELRS_DEBUG_SEED || ELRS_DEBUG_PHY || ELRS_DEBUG_RATESCAN || ELRS_DEBUG_TABELCHECK
+                      | SX1280_IRQ_PREAMBLE_DETECTED
+#endif
+                      ;
+    uint16_t dio1Mask = SX1280_IRQ_RX_DONE;   /* klaar voor interrupt-gedreven werking */
+    uint16_t dio2Mask = 0x0000;
+    uint16_t dio3Mask = 0x0000;
+
+    uint8_t buf[9] = {SX1280_SET_DIO_IRQ_PARAMS,
+                      (uint8_t)(irqMask >> 8),  (uint8_t)(irqMask & 0xFF),
+                      (uint8_t)(dio1Mask >> 8), (uint8_t)(dio1Mask & 0xFF),
+                      (uint8_t)(dio2Mask >> 8), (uint8_t)(dio2Mask & 0xFF),
+                      (uint8_t)(dio3Mask >> 8), (uint8_t)(dio3Mask & 0xFF)};
+
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_Transmit(&hspi2, buf, 9, HAL_MAX_DELAY);
+    SX1280_Deselect();
+}
+
+/* ==========================================================================
+ *  Setup voor ELRS 2.4 GHz, 50 Hz
+ * ========================================================================== */
+void SX1280_Setup_ELRS(void)
+{
+    uint8_t buf[10];
+
+    printf("\n--- SX1280 setup: ELRS 2.4GHz ---\n");
+    printf("Rate       : %s, interval %d us, hop per %d pakketten\n",
+           ELRS_RATE_NAAM, ELRS_PACKET_INTERVAL_US, ELRS_FHSS_HOP_INTERVAL);
+    printf("OTA versie : %d\n", ELRS_OTA_VERSION);
+    printf("CRC seed   : 0x%04X\n", (unsigned)ELRS_CRC_INIT);
+    printf("FHSS seed  : 0x%08lX\n", (unsigned long)ELRS_FHSS_SEED);
+    printf("IQ mode    : 0x%02X (%s)\n", ELRS_IQ_MODE,
+           (ELRS_IQ_MODE == SX1280_LORA_IQ_NORMAL) ? "normaal" : "omgedraaid");
+
+    SX1280_Reset();
+    HAL_Delay(10);
+
+    /* STANDBY_RC */
+    buf[0] = SX1280_SET_STANDBY;      buf[1] = 0x00;
+    SX1280_Cmd(buf, 2);
+
+    /* Regulator: LDO */
+    buf[0] = SX1280_SETREGULATORMODE; buf[1] = 0x00;
+    SX1280_Cmd(buf, 2);
+
+    /* Packet type LoRa. Dit moet VOOR SetModulationParams en SetPacketParams,
+     * want de betekenis van die parameters hangt ervan af. */
+    buf[0] = SX1280_SETPACKET_TYPE;   buf[1] = SX1280_PACKET_TYPE_LORA;
+    SX1280_Cmd(buf, 2);
+
+    SX1280_SetRfFrequency(ELRS_PARK_FREQ);
+
+    buf[0] = SX1280_SETBUFFER_BASEADDRESS; buf[1] = 0x00; buf[2] = 0x00;
+    SX1280_Cmd(buf, 3);
+
+    /* SF / BW800 / CR volgen uit ELRS_RATE in de header */
+    buf[0] = SX1280_SETMODULATIONPARAMS;
+    buf[1] = ELRS_SF;
+    buf[2] = ELRS_BW;
+    buf[3] = ELRS_CR;
+    SX1280_Cmd(buf, 4);
+
+    /* Datasheet p.131: deze waarde hangt af van de SF. Stond eerst hard op
+     * 0x1E (SF5/SF6) terwijl er SF8 gedraaid werd; nu volgt hij de rate. */
+    SX1280_WriteRegister(SX1280_REG_SF_ADDITIONAL_CONFIG, ELRS_SF_CONFIG_REG);
+    SX1280_WriteRegister(SX1280_REG_FREQ_ERR_CORRECTION,  0x01);
+
+    /* implicit header, 8 bytes payload, hardware-CRC uit.
+     * IQ stond op 0x00 = omgedraaid, wat de zender onzichtbaar maakt. */
+    buf[0] = SX1280_SET_PACKET_PARAMS;
+    buf[1] = ELRS_PREAMBLE_LEN;             /* mantisse, exponent 0 -> aantal symbolen */
+    buf[2] = SX1280_LORA_PACKET_IMPLICIT;
+    buf[3] = ELRS_PACKET_SIZE;
+    buf[4] = SX1280_LORA_CRC_OFF;           /* ELRS doet zijn eigen CRC14 */
+    buf[5] = ELRS_IQ_MODE;
+    SX1280_Cmd(buf, 6);
+
+#if ELRS_XTAL_TRIM >= 0
+    /* Vaste kristalbelasting, gevonden met SX1280_XtalSweep. Moet na elke
+     * overgang uit STDBY_RC opnieuw (datasheet 15.5). */
+    SX1280_SetXtalTrim((uint8_t)ELRS_XTAL_TRIM);
+    printf("kristaltrim: %d (%d.%d pF)\n", ELRS_XTAL_TRIM,
+           12 + ELRS_XTAL_TRIM / 2, (ELRS_XTAL_TRIM & 1) ? 5 : 0);
+#endif
+
+    SX1280_SetDioIrqParams();
+
+    /* ----------------------------------------------------------------------
+     *  TERUGLEZEN: staat de chip echt zoals we denken?
+     * ----------------------------------------------------------------------
+     *  SetModulationParams en SetPacketParams zijn schrijf-only, die kan je
+     *  niet controleren. De registers wel. Leest 0x0925 niet terug als wat we
+     *  er net in geschreven hebben, dan komen onze SPI-schrijfacties helemaal
+     *  niet aan en is al het andere zinloos om te onderzoeken.
+     * ---------------------------------------------------------------------- */
+    {
+        uint8_t r925 = SX1280_ReadRegister(SX1280_REG_SF_ADDITIONAL_CONFIG);
+        uint8_t r93C = SX1280_ReadRegister(SX1280_REG_FREQ_ERR_CORRECTION);
+        uint8_t r944 = SX1280_ReadRegister(SX1280_REG_LORA_SYNCWORD_MSB);
+        uint8_t r945 = SX1280_ReadRegister(SX1280_REG_LORA_SYNCWORD_LSB);
+
+        printf("\nregisters teruggelezen:\n");
+        printf("  0x0925 = 0x%02X  (geschreven 0x%02X)  %s\n",
+               r925, ELRS_SF_CONFIG_REG,
+               (r925 == ELRS_SF_CONFIG_REG) ? "OK" : "<<< KOMT NIET OVEREEN");
+        printf("  0x093C = 0x%02X  (geschreven 0x01)  %s\n",
+               r93C, (r93C == 0x01) ? "OK" : "<<< KOMT NIET OVEREEN");
+        printf("  0x0944 = 0x%02X  0x0945 = 0x%02X   (LoRa syncword, ELRS laat "
+               "dit op de standaardwaarde staan)\n", r944, r945);
+
+        /* Kristalbelasting teruglezen. Met C63/C64 eruit is alleen deze nog
+         * van belang: waarde 0..31 = 12,0 tot 27,5 pF per pin, effectief de
+         * helft plus wat print-strooicapaciteit. */
+        uint8_t rA0E = SX1280_ReadRegister(SX1280_REG_XTAL_TRIM_A);
+        uint8_t rA0F = SX1280_ReadRegister(SX1280_REG_XTAL_TRIM_B);
+        printf("  0x0A0E = 0x%02X  0x0A0F = 0x%02X   (kristaltrim %u = %u.%u pF "
+               "per pin, effectief ~%u pF)\n",
+               rA0E, rA0F, rA0E & 0x1F,
+               12 + (rA0E & 0x1F) / 2, ((rA0E & 0x1F) & 1) ? 5 : 0,
+               (12 + (rA0E & 0x1F) / 2) / 2 + 2);
+
+        if (r925 != ELRS_SF_CONFIG_REG || r93C != 0x01) {
+            printf("  !! Je registerschrijfacties komen niet aan. Zoek dit eerst\n");
+            printf("  !! uit voordat je verder gaat: SPI-timing of de BUSY-pin.\n");
+        }
+    }
+
+    /* Heeft de chip alle commando's geslikt? SetModulationParams en
+     * SetPacketParams zijn niet terug te lezen, maar een weigering staat wel
+     * in het statusbyte. */
+    SX1280_PrintStatus("na setup");
+
+    /* TIM3 telt 1 us per tick; de periode volgt uit de gekozen rate, zodat je
+     * bij het wisselen van rate niet ook nog in CubeMX hoeft te zijn. */
+    __HAL_TIM_SET_AUTORELOAD(&htim3, ELRS_PACKET_INTERVAL_US - 1);
+
+    SX1280_SetRx();
+    SX1280_PrintStatus("na SetRx");   /* mode hoort nu RX te zijn */
+
+    elrs_link_state = ELRS_STATE_SEARCHING;
+    elrs_nonce      = 0;
+    elrs_do_hop     = 0;
+    is_synchronized = 0;
+    fhss_index      = 0;
+    last_packet_time = HAL_GetTick();
+
+#if ELRS_DEBUG_PHY
+    printf("\n*** DEBUG_PHY AAN ***\n");
+    printf("Vast op %lu Hz (kanaal %d), geen FHSS, geen CRC-check.\n",
+           (unsigned long)ELRS_PARK_FREQ, ELRS_PARK_CHANNEL);
+    printf("Pakketten met type 3 of SNR < %d dB worden weggefilterd: dat is ruis.\n",
+           ELRS_DEBUG_MIN_SNR);
+    printf("Een enkele 'crc OK' bij brute-force zegt NIETS: dat gebeurt bij ruis\n");
+    printf("in 1,55%% van de pakketten. Let op BEVESTIGD of op SYNC crc=OK.\n\n");
+#else
+    printf("\nZoeken naar SYNC-pakket op kanaal %d...\n\n", ELRS_SYNC_CHANNEL);
+#endif
+}
+
+/* ==========================================================================
+ *  Spectrum-scan
+ * ==========================================================================
+ *  Meet alleen het RF-niveau per kanaal. Er wordt niets gedemoduleerd, dus
+ *  deze test staat volledig los van SF, preamble, CRC en UID. Daarmee kan je
+ *  onderscheid maken tussen "de zender staat uit" en "mijn radio-instellingen
+ *  kloppen niet", en dat is precies wat je niet kan zien aan een stroom
+ *  mislukte pakketten.
+ *
+ *  Draai hem twee keer: een keer met de T8L aan en een keer met de T8L uit.
+ *  Zendt hij, dan zie je het verschil onmiddellijk over de hele band.
+ * ========================================================================== */
+void SX1280_ScanBand(uint8_t sweeps)
+{
+    int8_t piek[ELRS_FREQ_COUNT];
+    int8_t ruisvloer = 0;
+
+    for (int i = 0; i < ELRS_FREQ_COUNT; i++) piek[i] = -128;
+
+    printf("\n--- RSSI scan, %d sweeps over %d kanalen ---\n", sweeps, ELRS_FREQ_COUNT);
+
+    for (uint8_t s = 0; s < sweeps; s++) {
+        for (uint8_t ch = 0; ch < ELRS_FREQ_COUNT; ch++) {
+            SX1280_SetRfFrequency(ELRS_FREQ_START + (uint32_t)ch * ELRS_FREQ_STEP_HZ);
+            SX1280_SetRx();
+
+            uint32_t t0 = HAL_GetTick();
+            while ((HAL_GetTick() - t0) < 3) {
+                int8_t r = SX1280_GetRssiInst();
+                if (r > piek[ch]) piek[ch] = r;
+            }
+        }
+    }
+
+    /* mediaan-achtige schatting van de vloer: laagste piek over alle kanalen */
+    ruisvloer = piek[0];
+    for (int i = 1; i < ELRS_FREQ_COUNT; i++) if (piek[i] < ruisvloer) ruisvloer = piek[i];
+
+    for (uint8_t ch = 0; ch < ELRS_FREQ_COUNT; ch++) {
+        uint32_t f = ELRS_FREQ_START + (uint32_t)ch * ELRS_FREQ_STEP_HZ;
+        printf("ch%2u %4lu.%luMHz %4d dBm ",
+               ch, (unsigned long)(f / 1000000UL),
+               (unsigned long)((f % 1000000UL) / 100000UL), piek[ch]);
+
+        int bars = (piek[ch] + 120) / 2;        /* -120 dBm -> 0, -40 dBm -> 40 */
+        if (bars < 0)  bars = 0;
+        if (bars > 45) bars = 45;
+        for (int b = 0; b < bars; b++) printf("#");
+        if (ch == ELRS_SYNC_CHANNEL) printf("  <- sync");
+        printf("\n");
+    }
+
+    printf("laagste piek (ruisvloer) : %d dBm\n", ruisvloer);
+    printf("Vergelijk dit met dezelfde scan terwijl de T8L UIT staat.\n");
+    printf("Geen verschil = de zender zendt niet, of niet in deze band.\n\n");
+}
+
+uint8_t SX1280_TestConnection(void)
+{
+    SX1280_Reset();
+    HAL_Delay(50);
+    uint8_t test_val = 0x45;
+    uint8_t test_offset = 0x00;
+    uint8_t tx_write[3] = {SX1280_WRITEBUFFER, test_offset, test_val};
+    uint8_t rx_write[3] = {0};
+
+    if (SX1280_BUSY() == 1) return 0;
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_write, rx_write, 3, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    uint8_t tx_read[4] = {SX1280_READBUFFER, test_offset, 0x00, 0x00};
+    uint8_t rx_read[4] = {0};
+    if (SX1280_BUSY() == 1) return 0;
+
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_read, rx_read, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    if(rx_read[3] == test_val) return 1;
+    return 0;
+}
+
+/* ==========================================================================
+ *  IRQ polling
+ * ========================================================================== */
+/* ==========================================================================
+ *  Frequentiesweep  --  kristalafwijking meten zonder meetapparatuur
+ * ==========================================================================
+ *  Zit jouw kristal er X kHz naast, dan zit je precies goed als je X kHz de
+ *  andere kant op afstemt. Dus verstemmen we stapsgewijs en kijken waar de
+ *  demodulator aanhaakt. De SNR is de maat: bij een echte vergrendeling
+ *  springt die van ongeveer 0 naar +8 dB of hoger.
+ * ========================================================================== */
+
+/* Kale RxDone-controle, zonder de IQ-sweep en zonder de waakhond. */
+static uint8_t SX1280_RxDoneRuw(void)
+{
+    uint8_t tx_buf[4] = {SX1280_GETIRQSTATUS, 0x00, 0x00, 0x00};
+    uint8_t rx_buf[4] = {0};
+
+    if (SX1280_BUSY() == 1) return 0;
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_buf, rx_buf, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    uint16_t irq = (uint16_t)((rx_buf[2] << 8) | rx_buf[3]);
+    if (irq != 0) {
+        uint8_t clr[3] = {SX1280_CLRIRQSTATUS, 0xFF, 0xFF};
+        SX1280_Select();
+        HAL_SPI_Transmit(&hspi2, clr, 3, HAL_MAX_DELAY);
+        SX1280_Deselect();
+    }
+    return (irq & SX1280_IRQ_RX_DONE) ? 1 : 0;
+}
+
+#if ELRS_DEBUG_TABELTEST
+/* ==========================================================================
+ *  TABELTEST: klopt de hoptabel, ja of nee?
+ * ==========================================================================
+ *  Alle eerdere tests waren indirect. Deze niet, en hij gebruikt bewust
+ *  NIETS van de gewone ontvangstlus: geen TIM3, geen hop-machinerie, geen
+ *  vergrendelingstoestand. Alleen de radio en de klok. Dat is met opzet,
+ *  want juist daar zit nog een onverklaarde tegenspraak: het kanaalprofiel
+ *  hoort kanaal 76 prima, de UID-zoeker hoorde daar niets. Wat die twee
+ *  onderscheidt is precies die machinerie.
+ *
+ *  Werkwijze per testkanaal:
+ *
+ *    1. Ga op kanaal 40 staan en wacht op een geldig SYNC-pakket. Dat geeft
+ *       de absolute index en de nonce van de zender, rechtstreeks uit zijn
+ *       eigen payload. Nul aannames.
+ *    2. Spring naar het testkanaal en blijf daar staan.
+ *    3. Elk sterk pakket dat daar binnenkomt: reken uit op welke index de
+ *       zender stond. De nonce volgt uit de CRC (we proberen alle 256), de
+ *       256-wrap lossen we op met de verstreken tijd.
+ *    4. Zeg onze tabel op die index het testkanaal? Dan een treffer.
+ *
+ *  De uitslag is niet voor tweeerlei uitleg vatbaar:
+ *       ~100% treffers -> de tabel klopt, het probleem zit in het hoppen
+ *       ~1%   treffers -> de tabel klopt niet (1 op 80 is puur toeval)
+ *
+ *  Kanaal 40 zou hier niet werken: dat staat bij elke denkbare tabel op
+ *  index 0, 80 en 160, dus daar is altijd 100% treffers. Vandaar dat we
+ *  uitsluitend op andere kanalen meten.
+ * ========================================================================== */
+
+/* Leest een binnengekomen pakket uit en valideert het. Geeft 1 bij een geldig
+ * pakket. Geen SetRx achteraf: we draaien in Rx Continuous. */
+static uint8_t ELRS_LeesPakket(uint8_t *payload, uint16_t *seed_uit,
+                               int8_t *rssi_uit, int8_t *snr_uit)
+{
+    if (!SX1280_RxDoneRuw()) return 0;
+
+    uint8_t st_cmd[4] = {SX1280_GETRXBUFFERSTATUS, 0, 0, 0};
+    uint8_t st[4] = {0};
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, st_cmd, st, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    SX1280_ReadBuffer(st[3], payload, ELRS_PACKET_SIZE);
+
+    uint16_t rec = ((uint16_t)(payload[0] >> 2) << 8) | payload[7];
+    uint8_t  cb[ELRS_CRC_CALC_LEN];
+    for (int i = 0; i < ELRS_CRC_CALC_LEN; i++) cb[i] = payload[i];
+    cb[0] &= 0x03;
+
+    if (!ELRS_ValidatePacket(cb, rec, seed_uit)) return 0;
+
+    SX1280_GetPacketStatus(rssi_uit, snr_uit);
+    return 1;
+}
+
+/* Wacht op het sync-kanaal op een echt SYNC-pakket. */
+static uint8_t ELRS_WachtOpSync(uint32_t timeout_ms, uint8_t *idx_uit,
+                                uint8_t *nonce_uit, uint32_t *tijd_uit)
+{
+    SX1280_SetRfFrequency(ELRS_SYNC_FREQ);
+    SX1280_SetRx();
+    (void)SX1280_RxDoneRuw();
+
+    uint32_t t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) < timeout_ms) {
+        uint8_t  pl[ELRS_PACKET_SIZE] = {0};
+        int8_t   rssi = 0, snr = -128;
+        uint16_t seed = 0;
+
+        if (!ELRS_LeesPakket(pl, &seed, &rssi, &snr)) continue;
+        if ((pl[0] & 0x03) != ELRS_PKT_SYNC) continue;
+        if (snr < ELRS_ACQ_MIN_SNR) continue;
+
+        /* De payload draagt UID4 en UID5 mee. Klopt dat niet, dan was het
+         * een toevallige CRC-match op ruis. */
+        if (pl[5] != ELRS_UID4 || pl[6] != ELRS_UID5) continue;
+        if (pl[1] >= ELRS_SEQUENCE_COUNT) continue;
+
+        *idx_uit   = pl[1];
+        *nonce_uit = pl[2];
+        *tijd_uit  = HAL_GetTick();
+        return 1;
+    }
+    return 0;
+}
+
+void SX1280_TabelTest(void)
+{
+    static const uint8_t kanalen[] = ELRS_TABELTEST_KANALEN;
+    const uint8_t n_kan = (uint8_t)(sizeof(kanalen) / sizeof(kanalen[0]));
+
+    uint32_t tot_goed = 0, tot_fout = 0;
+
+    printf("\n=== TABELTEST ===\n");
+    printf("  Per kanaal: eerst een SYNC op kanaal 40 voor de absolute index,\n");
+    printf("  dan %d ms stilstaan op het testkanaal en kijken of de zender\n",
+           ELRS_TABELTEST_MS);
+    printf("  daar is wanneer onze tabel dat zegt.\n\n");
+    printf("   kan | pakketten | klopt | fout | treffers\n");
+    printf("  -----+-----------+-------+------+----------\n");
+
+    for (uint8_t k = 0; k < n_kan; k++) {
+        uint8_t  ch = kanalen[k];
+        uint8_t  idx0 = 0, nonce0 = 0;
+        uint32_t t0 = 0;
+
+        if (!ELRS_WachtOpSync(6000, &idx0, &nonce0, &t0)) {
+            printf("   %3u |  geen SYNC binnen 6 s, kanaal overgeslagen\n", ch);
+            continue;
+        }
+
+        SX1280_SetRfFrequency(ELRS_FREQ_START + (uint32_t)ch * ELRS_FREQ_STEP_HZ);
+        SX1280_SetRx();
+        (void)SX1280_RxDoneRuw();      /* oud pakket van kanaal 40 weggooien */
+
+        uint32_t goed = 0, fout = 0, gezien = 0;
+        uint32_t tstart = HAL_GetTick();
+
+        while ((HAL_GetTick() - tstart) < ELRS_TABELTEST_MS) {
+            uint8_t  pl[ELRS_PACKET_SIZE] = {0};
+            int8_t   rssi = 0, snr = -128;
+            uint16_t seed = 0;
+
+            if (!ELRS_LeesPakket(pl, &seed, &rssi, &snr)) continue;
+            if (snr < ELRS_ACQ_MIN_SNR) continue;          /* buurkanaal weg */
+            if ((pl[0] & 0x03) != ELRS_PKT_RCDATA) continue;
+
+            gezien++;
+
+            /* De CRC-seed is CRC_INIT ^ nonce, dus de nonce rolt eruit. Dat
+             * zijn alleen de lage 8 bits; welke ronde het is halen we uit de
+             * verstreken tijd. Die hoeft maar op een halve seconde nauwkeurig
+             * te zijn, want het correctievenster is +/-128 nonces. */
+            uint8_t  nonce_laag = (uint8_t)(seed ^ ELRS_CRC_INIT);
+            uint32_t verstreken = HAL_GetTick() - t0;
+            uint32_t geschat    = verstreken * 1000u / ELRS_PACKET_INTERVAL_US;
+
+            int32_t d = (int32_t)(uint8_t)(nonce_laag - (uint8_t)(nonce0 + geschat));
+            if (d > 127) d -= 256;
+
+            /* Vlak na de sync kan de correctie de schatting onder nul duwen.
+             * Dat zou als uint32 omslaan naar een gigantische index. */
+            if ((int32_t)geschat + d < 0) continue;
+
+            uint32_t verlopen_nonces = (uint32_t)((int32_t)geschat + d);
+
+            /* Zelfde valkuil als in de hop zelf: floor((n - n0)/4) is NIET
+             * hetzelfde als floor(n/4) - floor(n0/4) zodra n0 geen veelvoud
+             * van 4 is. Dat verklaarde precies de 50% en 75% in de eerste
+             * meting: bij n0 % 4 = 2 hoor je 50% te halen, bij 1 juist 75%. */
+            uint32_t nonce_abs = (uint32_t)nonce0 + verlopen_nonces;
+            uint32_t idx = ((uint32_t)idx0
+                            + nonce_abs / ELRS_FHSS_HOP_INTERVAL
+                            - (uint32_t)(nonce0 / ELRS_FHSS_HOP_INTERVAL))
+                           % ELRS_SEQUENCE_COUNT;
+
+            if (fhss_sequence[idx] == ch) goed++; else fout++;
+        }
+
+        uint32_t pct = gezien ? (goed * 100u / gezien) : 0;
+        printf("   %3u |   %5lu   | %5lu | %4lu |  %3lu%%\n",
+               ch, (unsigned long)gezien, (unsigned long)goed,
+               (unsigned long)fout, (unsigned long)pct);
+
+        tot_goed += goed; tot_fout += fout;
+    }
+
+    uint32_t tot = tot_goed + tot_fout;
+    printf("\n  totaal: %lu van %lu kloppen",
+           (unsigned long)tot_goed, (unsigned long)tot);
+    if (tot) printf(" = %lu%%", (unsigned long)(tot_goed * 100u / tot));
+    printf("\n");
+
+    if (tot < 20) {
+        printf("\n  >>> Te weinig pakketten om iets te zeggen. Zet de zender\n");
+        printf("  >>> dichterbij of verhoog ELRS_TABELTEST_MS.\n\n");
+    } else if (tot_goed * 100u / tot >= 70) {
+        printf("\n  >>> DE TABEL KLOPT. Het probleem zit dus in het hoppen zelf:\n");
+        printf("  >>> de timing van de sprong of de uitvoering ervan, niet in\n");
+        printf("  >>> de tabel, de UID of de radio.\n\n");
+    } else if (tot_goed * 100u / tot <= 10) {
+        printf("\n  >>> DE TABEL KLOPT NIET. Bij toeval verwacht je 1 op 80,\n");
+        printf("  >>> oftewel ongeveer 1%%, en daar zitten we op. De invoer van\n");
+        printf("  >>> de generator is fout: UID of OTA-versie.\n\n");
+    } else {
+        printf("\n  >>> Tussen wal en schip. Waarschijnlijk loopt de nonce weg\n");
+        printf("  >>> tijdens de meting. Verlaag ELRS_TABELTEST_MS.\n\n");
+    }
+
+    SX1280_SetRfFrequency(ELRS_SYNC_FREQ);
+    SX1280_SetRx();
+}
+#endif /* ELRS_DEBUG_TABELTEST */
+
+#if ELRS_DEBUG_KANAALPROFIEL
+/* ==========================================================================
+ *  KANAALPROFIEL: op welke kanalen HOORT deze ontvanger de zender?
+ * ==========================================================================
+ *  Dit is de meting die de FHSS-tabel volledig buiten beschouwing laat.
+ *
+ *  De zender doorloopt alle 80 kanalen even vaak: elk kanaal staat precies
+ *  drie keer in de tabel van 240, en per index gaan er 4 pakketten uit. Een
+ *  volledige ronde duurt 240 x 4 x 4 ms = 3,84 s. Per kanaal is dat 12
+ *  pakketten per ronde, oftewel ruim 3 pakketten per seconde -- op ELK
+ *  kanaal, wat er ook in onze tabel staat.
+ *
+ *  Blijven we dus lang genoeg op een kanaal staan, dan MOETEN daar ongeveer
+ *  3 sterke pakketten per seconde binnenkomen. Doen ze dat op het ene kanaal
+ *  wel en op het andere niet, dan ligt het niet aan de tabel, niet aan de
+ *  timing en niet aan de UID, maar aan het front-end: antenne, aanpassing of
+ *  filter. Een profiel dat rond kanaal 40 piekt en naar de randen wegzakt is
+ *  precies wat een te smalle aanpassing doet.
+ *
+ *  We hoeven hiervoor niet vergrendeld te zijn: de CRC van RC-data wordt met
+ *  alle 256 nonces geprobeerd, dus er komt geen enkele timing aan te pas.
+ * ========================================================================== */
+void SX1280_KanaalProfiel(void)
+{
+    printf("\n=== KANAALPROFIEL ===\n");
+    printf("  %d kanalen (elke %d-e), %d ms elk = ongeveer %lu seconden.\n",
+           (ELRS_FREQ_COUNT + ELRS_KANAALPROFIEL_STAP - 1) / ELRS_KANAALPROFIEL_STAP,
+           ELRS_KANAALPROFIEL_STAP, ELRS_KANAALPROFIEL_MS,
+           (unsigned long)((ELRS_FREQ_COUNT + ELRS_KANAALPROFIEL_STAP - 1)
+                           / ELRS_KANAALPROFIEL_STAP * ELRS_KANAALPROFIEL_MS / 1000));
+    printf("  Verwacht op ELK kanaal ongeveer %d sterke pakketten.\n",
+           3 * ELRS_KANAALPROFIEL_MS / 1000);
+    printf("  Laat de zender aan staan en raak niets aan.\n\n");
+    printf("   kan |    MHz | sterk | zwak | beste SNR | beste RSSI\n");
+    printf("  -----+--------+-------+------+-----------+------------\n");
+
+    uint8_t  beste_kanaal = 0;
+    uint32_t beste_aantal = 0;
+    uint32_t totaal_sterk = 0;
+    uint8_t  kanalen_met  = 0;
+
+    for (uint8_t ch = 0; ch < ELRS_FREQ_COUNT; ch += ELRS_KANAALPROFIEL_STAP) {
+        uint32_t freq = ELRS_FREQ_START + (uint32_t)ch * ELRS_FREQ_STEP_HZ;
+
+        SX1280_SetRfFrequency(freq);
+        SX1280_SetRx();
+        (void)SX1280_RxDoneRuw();      /* oude IRQ weg, anders telt het vorige
+                                        * kanaal nog een pakket mee */
+
+        uint32_t sterk = 0, zwak = 0, t0 = HAL_GetTick();
+        int8_t   max_snr = -128, max_rssi = -128;
+
+        while ((HAL_GetTick() - t0) < ELRS_KANAALPROFIEL_MS) {
+            if (!SX1280_RxDoneRuw()) continue;
+
+            uint8_t st_cmd[4] = {SX1280_GETRXBUFFERSTATUS, 0, 0, 0};
+            uint8_t st[4] = {0};
+            SX1280_BUSY();
+            SX1280_Select();
+            HAL_SPI_TransmitReceive(&hspi2, st_cmd, st, 4, HAL_MAX_DELAY);
+            SX1280_Deselect();
+
+            uint8_t pl[ELRS_PACKET_SIZE] = {0};
+            SX1280_ReadBuffer(st[3], pl, ELRS_PACKET_SIZE);
+
+            uint16_t rec = ((uint16_t)(pl[0] >> 2) << 8) | pl[7];
+            uint8_t  cb[ELRS_CRC_CALC_LEN];
+            for (int i = 0; i < ELRS_CRC_CALC_LEN; i++) cb[i] = pl[i];
+            cb[0] &= 0x03;
+
+            if (!ELRS_ValidatePacket(cb, rec, NULL)) continue;
+
+            int8_t rssi = 0, snr = -128;
+            SX1280_GetPacketStatus(&rssi, &snr);
+
+            if (snr >= ELRS_ACQ_MIN_SNR) {
+                sterk++;
+                if (snr  > max_snr)  max_snr  = snr;
+                if (rssi > max_rssi) max_rssi = rssi;
+            } else {
+                zwak++;
+            }
+        }
+
+        /* Staafje erbij, want een kolom getallen lezen is lastiger dan een
+         * vorm zien. Dat is nu juist wat we willen weten: de VORM. */
+        char balk[21];
+        uint32_t n = sterk; if (n > 20) n = 20;
+        for (uint32_t i = 0; i < 20; i++) balk[i] = (i < n) ? '#' : ' ';
+        balk[20] = 0;
+
+        printf("   %3u | %4lu.%1lu | %5lu | %4lu |  ",
+               ch, (unsigned long)(freq / 1000000UL),
+               (unsigned long)((freq / 100000UL) % 10),
+               (unsigned long)sterk, (unsigned long)zwak);
+        if (sterk) printf("%+7d dB | %6d dBm  %s\n", max_snr, max_rssi, balk);
+        else       printf("      -    |      -     %s\n", balk);
+
+        totaal_sterk += sterk;
+        if (sterk) kanalen_met++;
+        if (sterk > beste_aantal) { beste_aantal = sterk; beste_kanaal = ch; }
+    }
+
+    uint8_t gemeten = (ELRS_FREQ_COUNT + ELRS_KANAALPROFIEL_STAP - 1)
+                      / ELRS_KANAALPROFIEL_STAP;
+
+    printf("\n  %lu sterke pakketten over %u kanalen, "
+           "op %u kanalen kwam er iets binnen.\n",
+           (unsigned long)totaal_sterk, gemeten, kanalen_met);
+    printf("  Sterkste kanaal: %u met %lu pakketten.\n",
+           beste_kanaal, (unsigned long)beste_aantal);
+
+    if (kanalen_met <= gemeten / 3) {
+        printf("\n  >>> De ontvanger hoort maar een KLEIN DEEL van de band.\n");
+        printf("  >>> De zender komt op alle 80 kanalen even vaak, dus dit\n");
+        printf("  >>> kan niet aan software liggen. Dit is het front-end:\n");
+        printf("  >>> antenne-aanpassing of filter te smal of verkeerd\n");
+        printf("  >>> afgestemd. Dat verklaart ook meteen waarom meehoppen\n");
+        printf("  >>> zo weinig oplevert.\n\n");
+    } else if (kanalen_met >= gemeten - 2) {
+        printf("\n  >>> Vlak profiel: het front-end is over de hele band goed.\n");
+        printf("  >>> Het probleem zit dan in de hop zelf, niet in de radio.\n\n");
+    } else {
+        printf("\n  >>> Het profiel is ongelijk. Kijk of de kanalen die het\n");
+        printf("  >>> wel doen bij elkaar liggen (dan front-end) of juist\n");
+        printf("  >>> verspreid staan (dan iets anders).\n\n");
+    }
+
+    /* Radio netjes terugzetten op het sync-kanaal. */
+    SX1280_SetRfFrequency(ELRS_SYNC_FREQ);
+    SX1280_SetRx();
+}
+#endif /* ELRS_DEBUG_KANAALPROFIEL */
+
+/* ==========================================================================
+ *  Kristalbelasting instellen  (datasheet 15.5 "Foot Capacitance Tuning")
+ * ==========================================================================
+ *  De volgorde is voorgeschreven: eerst STDBY_XOSC, dan pas de trimwaarde
+ *  schrijven. En dat moet opnieuw elke keer dat je uit STDBY_RC komt.
+ *  Waarde 0..31 komt overeen met ongeveer 12,0 tot 27,5 pF, 0,5 pF per stap.
+ * ========================================================================== */
+void SX1280_SetXtalTrim(uint8_t trim)
+{
+    uint8_t buf[2] = {SX1280_SET_STANDBY, 0x01};   /* 0x01 = STDBY_XOSC */
+    SX1280_Cmd(buf, 2);
+
+    trim &= 0x1F;
+    SX1280_WriteRegister(SX1280_REG_XTAL_TRIM_A, trim);
+    SX1280_WriteRegister(SX1280_REG_XTAL_TRIM_B, trim);
+}
+
+void SX1280_XtalSweep(void)
+{
+    int8_t  beste_snr  = -128;
+    uint8_t beste_trim = 0;
+
+    printf("\n=== KRISTALBELASTING SWEEP ===\n");
+    printf("  Registers 0x%04X en 0x%04X, waarde 0..31 = 12,0 tot 27,5 pF.\n",
+           SX1280_REG_XTAL_TRIM_A, SX1280_REG_XTAL_TRIM_B);
+    printf("  32 stappen van %d s = ongeveer %d seconden.\n",
+           ELRS_XTAL_DWELL_MS / 1000, 32 * ELRS_XTAL_DWELL_MS / 1000);
+    printf("  Laat de zender aan staan.\n\n");
+    printf("  trim |  pF  | pakketten | max SNR | max RSSI\n");
+    printf("  -----+------+-----------+---------+----------\n");
+
+    for (uint8_t trim = 0; trim < 32; trim++) {
+        SX1280_SetXtalTrim(trim);
+        SX1280_SetRfFrequency(ELRS_PARK_FREQ);
+        SX1280_SetRx();
+
+        uint32_t t0 = HAL_GetTick();
+        uint32_t n = 0;
+        int8_t maxsnr = -128, maxrssi = -128;
+
+        while ((HAL_GetTick() - t0) < ELRS_XTAL_DWELL_MS) {
+            if (SX1280_RxDoneRuw()) {
+                int8_t r = 0, s = 0;
+                SX1280_GetPacketStatus(&r, &s);
+                if (s > maxsnr)  maxsnr  = s;
+                if (r > maxrssi) maxrssi = r;
+                n++;
+                SX1280_SetRx();
+            }
+        }
+
+        printf("   %2u  | %2u.%u | %6lu    |  %+4d dB | %5d dBm%s\n",
+               trim, 12 + trim / 2, (trim & 1) ? 5 : 0,
+               (unsigned long)n, maxsnr, maxrssi,
+               (maxsnr >= 5) ? "   <== VERGRENDELING" : "");
+
+        if (maxsnr > beste_snr) { beste_snr = maxsnr; beste_trim = trim; }
+    }
+
+    printf("\n  beste trim: %u (%u.%u pF) met SNR %+d dB\n",
+           beste_trim, 12 + beste_trim / 2, (beste_trim & 1) ? 5 : 0, beste_snr);
+
+    if (beste_snr >= 5) {
+        printf("  >>> GEVONDEN. Zet ELRS_XTAL_TRIM op %u en deze sweep weer uit.\n",
+               beste_trim);
+        printf("  >>> De belasting van je kristal klopte niet. Kijk in je schema\n");
+        printf("  >>> of je externe condensatoren aan XTA/XTB hebt gezet; het\n");
+        printf("  >>> referentieontwerp heeft die niet.\n");
+    } else {
+        printf("  >>> Nergens een vergrendeling. De kristalbelasting is niet\n");
+        printf("  >>> het probleem, of het kristal loopt helemaal niet goed.\n");
+    }
+    printf("\n");
+}
+
+/* ==========================================================================
+ *  Meet het echte volgende kanaal
+ * ==========================================================================
+ *  Wacht op het sync-kanaal op een geldig RC-pakket. Op dat moment staat de
+ *  zender op een index waar kanaal 40 staat. Spring dan meteen naar een
+ *  testkanaal en luister kort. Komt daar iets geldigs binnen, dan is dat het
+ *  echte volgende kanaal.
+ *
+ *  Dit meet de FHSS-tabel in plaats van hem te berekenen, en is dus
+ *  onafhankelijk van de seed en het algoritme.
+ * ========================================================================== */
+
+/* Wacht tot er op het huidige kanaal een geldig pakket binnenkomt.
+ * Geeft 1 terug bij succes, 0 bij een timeout. */
+static uint8_t SX1280_WachtOpGeldigPakket(uint32_t timeout_ms, uint8_t *type_uit)
+{
+    uint32_t t0 = HAL_GetTick();
+
+    while ((HAL_GetTick() - t0) < timeout_ms) {
+        if (!SX1280_RxDoneRuw()) continue;
+
+        uint8_t buf[4] = {SX1280_GETRXBUFFERSTATUS, 0, 0, 0};
+        uint8_t st[4]  = {0};
+        SX1280_BUSY();
+        SX1280_Select();
+        HAL_SPI_TransmitReceive(&hspi2, buf, st, 4, HAL_MAX_DELAY);
+        SX1280_Deselect();
+
+        uint8_t pl[ELRS_PACKET_SIZE] = {0};
+        SX1280_ReadBuffer(st[3], pl, ELRS_PACKET_SIZE);
+
+        uint16_t rec = ((uint16_t)(pl[0] >> 2) << 8) | pl[7];
+        uint8_t  cb[ELRS_CRC_CALC_LEN];
+        for (int i = 0; i < ELRS_CRC_CALC_LEN; i++) cb[i] = pl[i];
+        cb[0] &= 0x03;
+
+        SX1280_SetRx();
+
+        if (ELRS_ValidatePacket(cb, rec, NULL)) {
+            if (type_uit) *type_uit = pl[0] & 0x03;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ==========================================================================
+ *  Burst-timing meten op het sync-kanaal
+ * ==========================================================================
+ *  Blijf staan en noteer wanneer er geldige pakketten binnenkomen. Uit de
+ *  tijdverschillen volgen het hop-interval en de bezoekperiode, zonder ook
+ *  maar iets aan te nemen over seed, algoritme of sequence-lengte.
+ * ========================================================================== */
+/* ==========================================================================
+ *  Alle pakketsnelheden aflopen
+ * ==========================================================================
+ *  Uit ExpressLRS_AirRateConfig[] voor SX128X (tag 4.1.0). Alleen de LoRa-
+ *  rijen; FLRC is een ander pakkettype en zou een aparte setup vragen.
+ * ========================================================================== */
+typedef struct {
+    const char *naam;
+    uint8_t sf;
+    uint8_t cr;
+    uint8_t preamble;
+    uint8_t payload;
+    uint8_t reg925;
+} elrs_rate_t;
+
+static const elrs_rate_t elrs_rates[] = {
+    { "500Hz  SF5", SX1280_LORA_SF5, SX1280_LORA_CR_LI_4_6, 12,  8, 0x1E },
+    { "333Hz8 SF5", SX1280_LORA_SF5, SX1280_LORA_CR_LI_4_8, 12, 13, 0x1E },
+    { "250Hz  SF6", SX1280_LORA_SF6, SX1280_LORA_CR_LI_4_8, 14,  8, 0x1E },
+    { "150Hz  SF7", SX1280_LORA_SF7, SX1280_LORA_CR_LI_4_8, 12,  8, 0x37 },
+    { "100Hz8 SF7", SX1280_LORA_SF7, SX1280_LORA_CR_LI_4_8, 12, 13, 0x37 },
+    { " 50Hz  SF8", SX1280_LORA_SF8, SX1280_LORA_CR_LI_4_8, 12,  8, 0x37 },
+};
+
+static void SX1280_ZetRate(const elrs_rate_t *r, uint8_t iq)
+{
+    uint8_t buf[6];
+
+    buf[0] = SX1280_SET_STANDBY;      buf[1] = 0x00;                     SX1280_Cmd(buf, 2);
+    buf[0] = SX1280_SETPACKET_TYPE;   buf[1] = SX1280_PACKET_TYPE_LORA;  SX1280_Cmd(buf, 2);
+
+    SX1280_SetRfFrequency(ELRS_PARK_FREQ);
+
+    buf[0] = SX1280_SETBUFFER_BASEADDRESS; buf[1] = 0x00; buf[2] = 0x00;
+    SX1280_Cmd(buf, 3);
+
+    buf[0] = SX1280_SETMODULATIONPARAMS;
+    buf[1] = r->sf; buf[2] = ELRS_BW; buf[3] = r->cr;
+    SX1280_Cmd(buf, 4);
+
+    /* Datasheet p.131: deze waarde hoort bij de gekozen SF. */
+    SX1280_WriteRegister(SX1280_REG_SF_ADDITIONAL_CONFIG, r->reg925);
+    SX1280_WriteRegister(SX1280_REG_FREQ_ERR_CORRECTION,  0x01);
+
+    buf[0] = SX1280_SET_PACKET_PARAMS;
+    buf[1] = r->preamble;
+    buf[2] = SX1280_LORA_PACKET_IMPLICIT;
+    buf[3] = r->payload;
+    buf[4] = SX1280_LORA_CRC_OFF;
+    buf[5] = iq;
+    SX1280_Cmd(buf, 6);
+
+    SX1280_SetDioIrqParams();
+    SX1280_SetRx();
+}
+
+void SX1280_RateScan(void)
+{
+    const uint8_t n = sizeof(elrs_rates) / sizeof(elrs_rates[0]);
+
+    printf("\n=== PAKKETSNELHEID ZOEKEN op kanaal %d ===\n", ELRS_PARK_CHANNEL);
+    printf("  %u standen x %d s, en elk in twee IQ-polariteiten.\n",
+           n, ELRS_RATESCAN_MS / 1000);
+    printf("  Totaal ongeveer %u seconden. Laat de zender aan staan.\n\n",
+           (unsigned)(n * 2 * ELRS_RATESCAN_MS / 1000));
+    printf("  stand      | IQ         | preambles | pakketten\n");
+    printf("  -----------+------------+-----------+----------\n");
+
+    uint32_t beste = 0;
+    const char *beste_naam = "geen";
+    const char *beste_iq = "";
+
+    for (uint8_t i = 0; i < n; i++) {
+        for (uint8_t q = 0; q < 2; q++) {
+            uint8_t iq = q ? SX1280_LORA_IQ_INVERTED : SX1280_LORA_IQ_NORMAL;
+
+            SX1280_ZetRate(&elrs_rates[i], iq);
+
+            uint32_t pre0 = elrs_preamble_count;
+            uint32_t pkt = 0;
+            uint32_t t0 = HAL_GetTick();
+
+            while ((HAL_GetTick() - t0) < ELRS_RATESCAN_MS) {
+                if (SX1280_RxDoneRuw()) { pkt++; SX1280_SetRx(); }
+            }
+
+            uint32_t pre = elrs_preamble_count - pre0;
+            printf("  %s | %-10s |   %5lu   |   %5lu%s\n",
+                   elrs_rates[i].naam, q ? "omgedraaid" : "normaal",
+                   (unsigned long)pre, (unsigned long)pkt,
+                   (pkt >= 3) ? "   <== HIER ZIT HIJ" : "");
+
+            if (pkt > beste) {
+                beste = pkt;
+                beste_naam = elrs_rates[i].naam;
+                beste_iq = q ? "omgedraaid" : "normaal";
+            }
+        }
+    }
+
+    printf("\n  meeste pakketten: %s met IQ %s (%lu stuks)\n",
+           beste_naam, beste_iq, (unsigned long)beste);
+    if (beste >= 3) {
+        printf("  >>> Zet je zender op deze snelheid, of pas ELRS_RATE aan.\n");
+    } else {
+        printf("  >>> Nergens iets. Dan zendt de zender niet op dit kanaal,\n");
+        printf("  >>> of gebruikt hij FLRC in plaats van LoRa.\n");
+    }
+    printf("\n");
+}
+
+void SX1280_BurstTiming(void)
+{
+    static uint32_t tijden[ELRS_BURST_AANTAL];
+    uint16_t n = 0;
+
+    printf("\n=== BURST-TIMING op kanaal %d ===\n", ELRS_SYNC_CHANNEL);
+    printf("  Wacht op %d geldige pakketten. Laat de zender aan staan.\n\n",
+           ELRS_BURST_AANTAL);
+
+    SX1280_SetRfFrequency(ELRS_SYNC_FREQ);
+    SX1280_SetRx();
+
+    uint32_t start = HAL_GetTick();
+    while (n < ELRS_BURST_AANTAL && (HAL_GetTick() - start) < 120000) {
+        if (SX1280_WachtOpGeldigPakket(2000, NULL)) {
+            tijden[n++] = HAL_GetTick();
+        }
+    }
+
+    if (n < 3) {
+        printf("  Te weinig pakketten (%u). Staat de zender aan?\n\n", n);
+        return;
+    }
+
+    printf("  nr | tijd (ms) | verschil met vorige\n");
+    printf("  ---+-----------+--------------------\n");
+    for (uint16_t i = 0; i < n; i++) {
+        uint32_t d = (i == 0) ? 0 : (tijden[i] - tijden[i-1]);
+        const char *label = "";
+        if (i > 0) {
+            if (d < 60)        label = "  <- zelfde bezoek";
+            else if (d > 2000) label = "  <- nieuw bezoek";
+        }
+        printf("  %2u | %8lu  | %6lu ms%s\n",
+               i, (unsigned long)(tijden[i] - tijden[0]),
+               (unsigned long)d, label);
+    }
+
+    /* Bursts tellen: alles binnen 60 ms hoort bij hetzelfde bezoek. */
+    uint16_t bursts = 1, in_burst = 1, grootste = 1;
+    uint32_t som_gat = 0, aantal_gat = 0;
+    for (uint16_t i = 1; i < n; i++) {
+        uint32_t d = tijden[i] - tijden[i-1];
+        if (d < 60) {
+            in_burst++;
+            if (in_burst > grootste) grootste = in_burst;
+        } else {
+            bursts++;
+            in_burst = 1;
+            if (d < 20000) { som_gat += d; aantal_gat++; }
+        }
+    }
+
+    printf("\n  %u pakketten in %u bezoeken, grootste bezoek %u pakketten\n",
+           n, bursts, grootste);
+    if (aantal_gat) {
+        uint32_t gem = som_gat / aantal_gat;
+        printf("  gemiddelde tijd tussen bezoeken: %lu ms\n", (unsigned long)gem);
+        printf("\n  Een bezoekinterval is 80 hops:\n");
+        printf("    hop-interval 2 -> 80 x 2 x 20 ms = 3200 ms\n");
+        printf("    hop-interval 4 -> 80 x 4 x 20 ms = 6400 ms\n");
+        if (gem > 2400 && gem < 4200) {
+            printf("  >>> Dit past op hop-interval 2. Onze instelling klopt.\n");
+        } else if (gem > 5200 && gem < 8000) {
+            printf("  >>> Dit past op hop-interval 4! Zet ELRS_FHSS_HOP_INTERVAL\n");
+            printf("  >>> op 4; dat verklaart waarom het hoppen niets oplevert.\n");
+        } else {
+            printf("  >>> Past op geen van beide. Mogelijk mis je bezoeken, of\n");
+            printf("  >>> de zender hopt anders dan we aannemen.\n");
+        }
+    }
+    printf("\n");
+}
+
+void SX1280_NextChannelScan(void)
+{
+    static uint16_t treffers[ELRS_FREQ_COUNT];
+    static uint16_t pogingen[ELRS_FREQ_COUNT];
+
+    for (int i = 0; i < ELRS_FREQ_COUNT; i++) { treffers[i] = 0; pogingen[i] = 0; }
+
+    printf("\n=== METING: welk kanaal komt NA het sync-kanaal? ===\n");
+    printf("  Onze tabel voorspelt kanaal %u (fhss_sequence[1]).\n", fhss_sequence[1]);
+    printf("  %d rondes over %d kanalen, luistervenster %d ms.\n",
+           ELRS_NEXTCH_RONDES, ELRS_FREQ_COUNT, ELRS_NEXTCH_LUISTER_MS);
+    printf("  Dit duurt een paar minuten. Laat de zender aan staan.\n\n");
+
+    for (uint8_t ronde = 0; ronde < ELRS_NEXTCH_RONDES; ronde++) {
+        for (uint8_t ch = 0; ch < ELRS_FREQ_COUNT; ch++) {
+
+            /* 1. terug naar het sync-kanaal en wachten op een geldig pakket */
+            SX1280_SetRfFrequency(ELRS_SYNC_FREQ);
+            SX1280_SetRx();
+            if (!SX1280_WachtOpGeldigPakket(3000, NULL)) continue;
+
+            /* 2. onmiddellijk naar het testkanaal */
+            SX1280_SetRfFrequency(ELRS_FREQ_START + (uint32_t)ch * ELRS_FREQ_STEP_HZ);
+            SX1280_SetRx();
+
+            pogingen[ch]++;
+            if (SX1280_WachtOpGeldigPakket(ELRS_NEXTCH_LUISTER_MS, NULL)) {
+                treffers[ch]++;
+            }
+        }
+        printf("  ronde %u van %d klaar\n", ronde + 1, ELRS_NEXTCH_RONDES);
+    }
+
+    printf("\n  kanaal | pogingen | treffers\n");
+    printf("  -------+----------+---------\n");
+    uint8_t beste = 0;
+    for (uint8_t ch = 0; ch < ELRS_FREQ_COUNT; ch++) {
+        if (treffers[ch] > treffers[beste]) beste = ch;
+        if (treffers[ch] > 0) {
+            printf("    %2u   |   %4u   |  %4u%s%s\n", ch, pogingen[ch], treffers[ch],
+                   (ch == fhss_sequence[1]) ? "   <- onze voorspelling" : "",
+                   (ch == ELRS_SYNC_CHANNEL) ? "   (sync-kanaal zelf)" : "");
+        }
+    }
+
+    printf("\n  meeste treffers: kanaal %u (%u van %u)\n",
+           beste, treffers[beste], pogingen[beste]);
+    printf("  onze tabel zegt: kanaal %u\n", fhss_sequence[1]);
+    if (beste == fhss_sequence[1] && treffers[beste] > 0) {
+        printf("  >>> De FHSS-tabel klopt. Het probleem zit in de timing.\n");
+    } else if (treffers[beste] == 0) {
+        printf("  >>> Nergens iets gevangen. Het luistervenster is te kort,\n");
+        printf("  >>> of de zender hopt anders dan verwacht.\n");
+    } else {
+        printf("  >>> De FHSS-tabel klopt NIET. Het echte volgende kanaal is %u.\n", beste);
+        printf("  >>> Probeer de andere FHSS-seed (0xDB76C7A2) of een andere\n");
+        printf("  >>> sequence-lengte.\n");
+    }
+    printf("\n");
+
+    SX1280_SetRfFrequency(ELRS_SYNC_FREQ);
+    SX1280_SetRx();
+}
+
+void SX1280_FreqSweep(void)
+{
+    int32_t beste_off = 0;
+    int8_t  beste_snr = -128;
+    uint32_t stappen = (2 * ELRS_FSWEEP_RANGE_KHZ) / ELRS_FSWEEP_STEP_KHZ + 1;
+
+    printf("\n=== FREQUENTIESWEEP ===\n");
+    printf("  Kanaal %d (%lu Hz), offset van %+d tot %+d kHz in stappen van %d kHz.\n",
+           ELRS_PARK_CHANNEL, (unsigned long)ELRS_PARK_FREQ,
+           -ELRS_FSWEEP_RANGE_KHZ, ELRS_FSWEEP_RANGE_KHZ, ELRS_FSWEEP_STEP_KHZ);
+    printf("  %lu stappen van %d s = ongeveer %lu seconden.\n",
+           (unsigned long)stappen, ELRS_FSWEEP_DWELL_MS / 1000,
+           (unsigned long)(stappen * ELRS_FSWEEP_DWELL_MS / 1000));
+    printf("  Laat de zender gewoon aan staan, hij hoeft niets bijzonders te doen.\n\n");
+    printf("  offset kHz | pakketten | max SNR | max RSSI\n");
+    printf("  -----------+-----------+---------+----------\n");
+
+    for (int32_t off = -ELRS_FSWEEP_RANGE_KHZ; off <= ELRS_FSWEEP_RANGE_KHZ;
+         off += ELRS_FSWEEP_STEP_KHZ)
+    {
+        uint32_t f = (uint32_t)((int32_t)ELRS_PARK_FREQ + off * 1000);
+        SX1280_SetRfFrequency(f);
+        SX1280_SetRx();
+
+        uint32_t t0 = HAL_GetTick();
+        uint32_t n = 0;
+        int8_t maxsnr = -128, maxrssi = -128;
+
+        while ((HAL_GetTick() - t0) < ELRS_FSWEEP_DWELL_MS) {
+            if (SX1280_RxDoneRuw()) {
+                int8_t r = 0, s = 0;
+                SX1280_GetPacketStatus(&r, &s);
+                if (s > maxsnr)  maxsnr  = s;
+                if (r > maxrssi) maxrssi = r;
+                n++;
+                SX1280_SetRx();
+            }
+        }
+
+        printf("  %+8ld   |  %6lu   |  %+4d dB | %5d dBm%s\n",
+               (long)off, (unsigned long)n, maxsnr, maxrssi,
+               (maxsnr >= 5) ? "   <== VERGRENDELING" : "");
+
+        if (maxsnr > beste_snr) { beste_snr = maxsnr; beste_off = off; }
+    }
+
+    printf("\n  beste offset: %+ld kHz met SNR %+d dB\n", (long)beste_off, beste_snr);
+
+    if (beste_snr >= 5) {
+        long ppm = (beste_off * 1000L * 1000000L) / (long)ELRS_PARK_FREQ;
+        printf("  >>> GEVONDEN. Je kristal zit er ongeveer %ld ppm naast.\n", -ppm);
+        printf("  >>> Zet ELRS_FREQ_CORRECTIE_HZ op %ld en zet deze sweep weer uit.\n",
+               (long)beste_off * 1000L);
+        printf("  >>> Draai daarna de sweep nog eens met STEP 20 kHz en RANGE 150\n");
+        printf("  >>> om het fijner af te regelen.\n");
+    } else {
+        printf("  >>> Nergens een vergrendeling. De frequentie is niet het probleem.\n");
+        printf("  >>> Over het hele bereik van %+d tot %+d kHz blijft de SNR laag,\n",
+               -ELRS_FSWEEP_RANGE_KHZ, ELRS_FSWEEP_RANGE_KHZ);
+        printf("  >>> en dat is veel breder dan de +/- 200 kHz die LoRa verdraagt.\n");
+    }
+    printf("\n");
+
+    SX1280_SetRfFrequency(ELRS_PARK_FREQ);
+    SX1280_SetRx();
+}
+
+/* ==========================================================================
+ *  Frequentiefout-indicator (FEI)
+ * ==========================================================================
+ *  Registers 0x954 (bits 0:3 = FEI 16:19), 0x955 (FEI 8:15), 0x956 (FEI 0:7).
+ *  Samen een 20-bits waarde in twee-complement. De omrekening naar Hz komt
+ *  uit de Semtech-referentiedriver en is een benadering:
+ *      Hz = 1.55 * FEI / (1625000 / bandbreedte_in_Hz)
+ *  Voor BW 800 kHz komt dat neer op ongeveer 0,775 Hz per eenheid.
+ * ========================================================================== */
+int32_t SX1280_GetFrequencyError(int32_t *fei_ruw)
+{
+    uint32_t v = ((uint32_t)(SX1280_ReadRegister(0x0954) & 0x0F) << 16)
+               | ((uint32_t)SX1280_ReadRegister(0x0955) << 8)
+               |  (uint32_t)SX1280_ReadRegister(0x0956);
+
+    int32_t fei = (int32_t)v;
+    if (fei & (1 << 19)) fei -= (1 << 20);      /* tekenuitbreiding */
+    if (fei_ruw) *fei_ruw = fei;
+
+    /* 1.55 * fei / (1625000 / 812500) = 1.55 * fei / 2 = 0.775 * fei */
+    return (int32_t)((fei * 775) / 1000);
+}
+
+/* ==========================================================================
+ *  Draaggolftest voor het kristal
+ * ========================================================================== */
+void SX1280_CarrierTest(uint32_t freq_hz, int8_t power_dbm)
+{
+    uint8_t buf[4];
+
+    /* Zelfde omrekening als SX1280_SetRfFrequency, maar we willen zien wat
+     * er precies in het register terechtkomt en welke frequentie dat is. */
+    uint32_t reg = (uint32_t)(((uint64_t)freq_hz << 18) / 52000000UL);
+    uint32_t echt = (uint32_t)(((uint64_t)reg * 52000000UL) >> 18);
+
+    printf("\n=== DRAAGGOLFTEST ===\n");
+    printf("  gevraagd     : %lu Hz\n", (unsigned long)freq_hz);
+    printf("  registerwaarde: 0x%06lX\n", (unsigned long)reg);
+    printf("  komt overeen met %lu Hz (afronding kost %ld Hz, verwaarloosbaar)\n",
+           (unsigned long)echt, (long)echt - (long)freq_hz);
+    printf("  vermogen     : %d dBm\n\n", power_dbm);
+
+    SX1280_Reset();
+    HAL_Delay(10);
+
+    buf[0] = SX1280_SET_STANDBY;      buf[1] = 0x00;                     SX1280_Cmd(buf, 2);
+    buf[0] = SX1280_SETREGULATORMODE; buf[1] = 0x00;                     SX1280_Cmd(buf, 2);
+    buf[0] = SX1280_SETPACKET_TYPE;   buf[1] = SX1280_PACKET_TYPE_LORA;  SX1280_Cmd(buf, 2);
+
+    SX1280_SetRfFrequency(freq_hz);
+    SX1280_SetTxParams(power_dbm, 0xE0);   /* 20 us ramp */
+    SX1280_SetTxContinuousWave();
+
+    SX1280_PrintStatus("draaggolf");
+
+    printf("\n  De zender staat nu continu aan. Meet de piek met je analyzer.\n");
+    printf("  Reken de afwijking om naar ppm:  ppm = (gemeten - %lu) / %lu\n",
+           (unsigned long)freq_hz, (unsigned long)(freq_hz / 1000000UL));
+    printf("  (dus: verschil in Hz gedeeld door %lu geeft ppm)\n\n",
+           (unsigned long)(freq_hz / 1000000UL));
+    printf("  beoordeling van het resultaat:\n");
+    printf("    binnen  +/-  24 kHz  ->  onder 10 ppm, prima kristal\n");
+    printf("    binnen  +/-  98 kHz  ->  onder 40 ppm, nog ruim binnen budget\n");
+    printf("    binnen  +/- 195 kHz  ->  onder 80 ppm, de grens uit tabel 6-3\n");
+    printf("    meer dan +/- 195 kHz ->  DIT IS JE PROBLEEM, de demodulator\n");
+    printf("                             kan nooit vergrendelen\n\n");
+    printf("  Vergeet niet dat de T8L er zelf ook een paar ppm naast zit;\n");
+    printf("  de 80 ppm uit de tabel geldt voor de twee radio's SAMEN.\n\n");
+
+    while (1) { HAL_Delay(1000); }   /* blijf zenden */
+}
+
+/* ==========================================================================
+ *  IQ-sweep
+ * ==========================================================================
+ *  Zet de packet parameters opnieuw met een andere IQ-polariteit. Alle andere
+ *  parameters blijven gelijk. Daarna moet SetRx opnieuw, want de radio komt
+ *  uit ontvangst zodra je de packet params aanpast.
+ * ========================================================================== */
+volatile uint8_t elrs_iq_actueel = ELRS_IQ_MODE;
+
+void SX1280_SetPacketParamsIQ(uint8_t iq)
+{
+    uint8_t buf[6];
+    buf[0] = SX1280_SET_PACKET_PARAMS;
+    buf[1] = ELRS_PREAMBLE_LEN;
+    buf[2] = SX1280_LORA_PACKET_IMPLICIT;
+    buf[3] = ELRS_PACKET_SIZE;
+    buf[4] = SX1280_LORA_CRC_OFF;
+    buf[5] = iq;
+    SX1280_Cmd(buf, 6);
+    SX1280_SetRx();
+}
+
+void ELRS_IQSweepTick(void)
+{
+#if ELRS_IQ_SWEEP
+    static uint32_t wissel_tijd = 0;
+
+    uint32_t nu = HAL_GetTick();
+    if (wissel_tijd == 0) { wissel_tijd = nu; return; }
+    if ((nu - wissel_tijd) < ELRS_IQ_SWEEP_MS) return;
+
+    wissel_tijd = nu;
+    elrs_iq_actueel = (elrs_iq_actueel == SX1280_LORA_IQ_NORMAL)
+                      ? SX1280_LORA_IQ_INVERTED : SX1280_LORA_IQ_NORMAL;
+    SX1280_SetPacketParamsIQ(elrs_iq_actueel);
+#endif
+}
+
+/* ==========================================================================
+ *  UID-ZOEKER
+ * ==========================================================================
+ *  Zie de uitleg bij ELRS_DEBUG_UIDZOEK in sx1280include.h. Kort:
+ *  UID4, UID5 en de OTA-versie staan vast dankzij het sync-pakket. UID2 en
+ *  UID3 zitten alleen in de FHSS-seed en nergens in de CRC, dus die kunnen
+ *  stilletjes verkeerd staan. Er blijven 65536 mogelijkheden over en die
+ *  lopen we gewoon allemaal na.
+ * ========================================================================== */
+volatile uint8_t elrs_hop_pauze      = 0;
+volatile uint8_t elrs_anker_van_sync = 0;
+
+#if ELRS_DEBUG_UIDZOEK
+
+/* Losse PRNG-staat, zodat de zoeker de gewone FHSS-tabel niet aanraakt. */
+static uint32_t uz_rng_state;
+
+static uint16_t uz_rng(void)
+{
+    uz_rng_state = (uint32_t)(214013u * uz_rng_state + 2531011u) % 2147483648u;
+    return (uint16_t)(uz_rng_state >> 16);
+}
+
+/* De begintoestand van de tabel hangt NIET van de seed af, alleen de shuffle.
+ * Een keer opbouwen en daarna kopieren scheelt de helft van het rekenwerk. */
+static uint8_t uz_sjabloon[ELRS_SEQUENCE_BUFFER];
+static uint8_t uz_tabel[ELRS_SEQUENCE_BUFFER];
+
+static void ELRS_UidZoekSjabloon(void)
+{
+    for (uint16_t i = 0; i < ELRS_SEQUENCE_BUFFER; i++) uz_sjabloon[i] = 0;
+
+    for (uint16_t i = 0; i < ELRS_SEQUENCE_COUNT; i++) {
+        if      ((i % ELRS_FREQ_COUNT) == 0)                  uz_sjabloon[i] = ELRS_SYNC_CHANNEL;
+        else if ((i % ELRS_FREQ_COUNT) == ELRS_SYNC_CHANNEL)  uz_sjabloon[i] = 0;
+        else                                                  uz_sjabloon[i] = (uint8_t)(i % ELRS_FREQ_COUNT);
+    }
+}
+
+/* Exact dezelfde shuffle als FHSS_GenerateSequence, maar op uz_tabel. */
+static void ELRS_UidZoekBouw(uint32_t seed)
+{
+    for (uint16_t i = 0; i < ELRS_SEQUENCE_BUFFER; i++) uz_tabel[i] = uz_sjabloon[i];
+
+    uz_rng_state = seed;
+
+    for (uint16_t i = 0; i < ELRS_SEQUENCE_COUNT; i++) {
+        if ((i % ELRS_FREQ_COUNT) != 0) {
+            uint8_t off  = (uint8_t)((i / ELRS_FREQ_COUNT) * ELRS_FREQ_COUNT);
+            uint8_t rand = (uint8_t)(uz_rng() % (ELRS_FREQ_COUNT - 1)) + 1;
+            uint8_t tmp  = uz_tabel[i];
+            uz_tabel[i]          = uz_tabel[off + rand];
+            uz_tabel[off + rand] = tmp;
+        }
+    }
+}
+
+/* Waarnemingen: indexen waarop we op het meetkanaal een sterk pakket zagen. */
+static uint16_t uz_index[ELRS_UIDZOEK_WAARN];
+static uint8_t  uz_aantal = 0;
+static uint8_t  uz_fase   = 0;      /* 0 wachten, 1 meten, 2 klaar */
+static uint32_t uz_start  = 0;
+
+/* Wordt aangeroepen bij elk geldig pakket terwijl de link staat. */
+void ELRS_UidZoekPakket(void)
+{
+    if (uz_fase != 1) return;
+    if (uz_aantal >= ELRS_UIDZOEK_WAARN) return;
+
+    /* Alleen pakketten die ECHT van dit kanaal komen. Een buurkanaal lekt er
+     * met -105 dBm doorheen en zou de waarneming vergiftigen. */
+    int8_t rssi = 0, snr = -128;
+    SX1280_GetPacketStatus(&rssi, &snr);
+    if (snr < ELRS_ACQ_MIN_SNR) return;
+
+    uint32_t d   = elrs_ticks - elrs_anker_ticks;
+    uint16_t idx = (uint16_t)(((uint32_t)elrs_anker_index
+                    + d / ELRS_FHSS_HOP_INTERVAL) % ELRS_SEQUENCE_COUNT);
+
+    /* Alleen VERSCHILLENDE indexen tellen. Vier pakketten binnen dezelfde
+     * hop leveren dezelfde index en dus geen extra informatie. */
+    for (uint8_t k = 0; k < uz_aantal; k++)
+        if (uz_index[k] == idx) return;
+
+    uz_index[uz_aantal++] = idx;
+    printf("  waarneming %u van %u: index %u  (SNR %+d)\n",
+           uz_aantal, ELRS_UIDZOEK_WAARN, idx, snr);
+}
+
+static void ELRS_UidZoekReken(void)
+{
+    /* Puntentelling in plaats van alles-of-niets. Glipt er een pakket van een
+     * buurkanaal doorheen, dan is een waarneming fout en zou een harde eis
+     * NUL kandidaten opleveren -- het slechtst denkbare foutgedrag, want dan
+     * lijkt het alsof de UID niet de oorzaak is. Met een score zie je dat
+     * verschil meteen: 3 van 3 is raak, 2 van 3 betekent een vuile meting. */
+    uint8_t  beste_score  = 0;
+    uint16_t aantal_beste = 0;
+    uint32_t hi_a = 0, hi_b = 0;
+
+    printf("\n=== ZOEKEN NAAR UID2 EN UID3 ===\n");
+    printf("  %u waarnemingen op kanaal %u, 65536 kandidaten\n",
+           uz_aantal, ELRS_UIDZOEK_KANAAL);
+    printf("  dit duurt een paar seconden...\n");
+
+    ELRS_UidZoekSjabloon();
+
+    for (uint32_t hi = 0; hi < 65536u; hi++) {
+        uint32_t seed = (hi << 16)
+                      | ((uint32_t)ELRS_UID4 << 8)
+                      | (uint32_t)(ELRS_UID5 ^ ELRS_OTA_VERSION);
+
+        ELRS_UidZoekBouw(seed);
+
+        uint8_t score = 0;
+        for (uint8_t k = 0; k < uz_aantal; k++)
+            if (uz_tabel[uz_index[k]] == ELRS_UIDZOEK_KANAAL) score++;
+
+        if (score > beste_score) {
+            beste_score = score; aantal_beste = 1; hi_a = hi;
+        } else if (score == beste_score && beste_score > 0) {
+            if (aantal_beste == 1) hi_b = hi;
+            aantal_beste++;
+        }
+    }
+
+    printf("\n  beste score: %u van %u, behaald door %u kandidaten\n",
+           beste_score, uz_aantal, aantal_beste);
+
+    if (beste_score < uz_aantal) {
+        printf("\n  >>> Geen enkele kandidaat haalt alle waarnemingen.\n");
+        printf("  >>> De fout zit dus NIET (alleen) in UID2/UID3. Verdacht:\n");
+        printf("  >>>   - een pakket van een buurkanaal dat door de SNR-drempel kwam\n");
+        printf("  >>>   - het ankerpunt, oftewel de index uit het sync-pakket\n");
+        printf("  >>>   - de hop-interval (nu %d pakketten per hop)\n\n",
+               ELRS_FHSS_HOP_INTERVAL);
+        return;
+    }
+
+    /* Twee treffers die 128 schelen in UID2 zijn GEEN onzekerheid.
+     * De generator rekent modulo 2^31, dus de bovenste bit van de seed --
+     * en dat is precies de bovenste bit van UID2 -- wordt bij de allereerste
+     * stap weggegooid. Beide waarden geven daarom letterlijk dezelfde tabel. */
+    uint8_t a2 = (uint8_t)(hi_a >> 8), a3 = (uint8_t)(hi_a & 0xFF);
+    uint8_t b2 = (uint8_t)(hi_b >> 8), b3 = (uint8_t)(hi_b & 0xFF);
+
+    if (aantal_beste == 2 && a3 == b3 && (uint8_t)(a2 ^ b2) == 0x80) {
+        printf("\n  >>> GEVONDEN: UID3 = %u, UID2 = %u of %u\n", a3, a2, b2);
+        printf("  >>> Die twee schelen 128 en geven dezelfde tabel: de PRNG\n");
+        printf("  >>> rekent modulo 2^31, dus de hoogste bit van UID2 doet\n");
+        printf("  >>> niet mee. Neem gewoon de eerste.\n");
+    } else if (aantal_beste == 1) {
+        printf("\n  >>> GEVONDEN: UID2 = %u, UID3 = %u\n", a2, a3);
+    } else {
+        printf("\n  >>> %u kandidaten met dezelfde score, o.a. (%u,%u) en (%u,%u).\n",
+               aantal_beste, a2, a3, b2, b3);
+        printf("  >>> Er is een waarneming te weinig; laat nog een ronde lopen.\n\n");
+        return;
+    }
+
+    printf("\n  >>> In sx1280include.h staat nu UID2 = %u, UID3 = %u.\n",
+           ELRS_UID2, ELRS_UID3);
+    if (a2 == ELRS_UID2 || b2 == ELRS_UID2) {
+        if (a3 == ELRS_UID3) {
+            printf("  >>> Dat klopt dus al. De hoptabel is niet je probleem;\n");
+            printf("  >>> dan blijft de hop-TIMING over (fase en interval).\n\n");
+            return;
+        }
+    }
+    printf("  >>> Pas UID2 en UID3 aan, zet ELRS_DEBUG_UIDZOEK op 0.\n\n");
+}
+
+void ELRS_UidZoekTick(void)
+{
+    if (uz_fase == 2) return;
+
+    if (uz_fase == 0) {
+        /* Pas beginnen als de index bewezen is door een echt sync-pakket. */
+        if (elrs_link_state != ELRS_STATE_LOCKED || !elrs_anker_van_sync) return;
+
+        uz_fase   = 1;
+        uz_aantal = 0;
+        uz_start  = HAL_GetTick();
+
+        /* Blijf staan waar we staan, maar dan op het meetkanaal. */
+        elrs_hop_pauze = 1;
+        SX1280_SetRfFrequency(ELRS_FREQ_START
+                              + (uint32_t)ELRS_UIDZOEK_KANAAL * ELRS_FREQ_STEP_HZ);
+        SX1280_SetRx();
+
+        /* Gooi wat er nog in de chip staat weg. Zonder dit werd het laatste
+         * pakket van kanaal 40 -- inclusief zijn SNR van +12 -- geteld als
+         * eerste waarneming op het nieuwe kanaal. Dat leverde meteen een
+         * onmogelijke waarneming op: index 80, waar de tabel kanaal 40 zegt. */
+        (void)SX1280_RxDoneRuw();
+
+        printf("\n=== UID-ZOEKER ===\n");
+        printf("  Anker staat op index %u uit een sync-pakket.\n",
+               elrs_anker_index);
+        printf("  Nu vast op kanaal %u (%lu Hz), niet hoppen.\n",
+               ELRS_UIDZOEK_KANAAL,
+               (unsigned long)(ELRS_FREQ_START
+                    + (uint32_t)ELRS_UIDZOEK_KANAAL * ELRS_FREQ_STEP_HZ));
+        printf("  Wachten tot de zender %u keer langskomt. Even niets aanraken.\n\n",
+               ELRS_UIDZOEK_WAARN);
+        return;
+    }
+
+    /* De waakhond mag hier niet toeslaan: op een gewoon kanaal komt de zender
+     * maar drie keer per 3,8 s langs, met stiltes daartussen. */
+    last_packet_time = HAL_GetTick();
+
+    if (uz_aantal >= ELRS_UIDZOEK_WAARN) {
+        ELRS_UidZoekReken();
+        uz_fase = 2;
+    }
+    else if ((HAL_GetTick() - uz_start) > ELRS_UIDZOEK_MS) {
+        if (uz_aantal >= 2) {
+            printf("\n  Tijd op met %u waarnemingen. Twee grenst het al af tot\n"
+                   "  een handvol kandidaten, dus we rekenen toch.\n", uz_aantal);
+            ELRS_UidZoekReken();
+        } else {
+            printf("\n  Te weinig waarnemingen (%u) op kanaal %u.\n",
+                   uz_aantal, ELRS_UIDZOEK_KANAAL);
+            printf("  Probeer een ander ELRS_UIDZOEK_KANAAL, of zet de zender dichterbij.\n\n");
+        }
+        uz_fase = 2;
+    }
+
+    /* Klaar? Dan het hoppen weer vrijgeven. Zonder dit bleef de ontvanger na
+     * de meting voor altijd op het meetkanaal staan -- en leek het alsof de
+     * gewone werking daarna nog steeds stuk was. */
+    if (uz_fase == 2) {
+        elrs_hop_pauze = 0;
+        SX1280_SetRfFrequency(ELRS_SYNC_FREQ);
+        SX1280_SetRx();
+    }
+}
+#endif /* ELRS_DEBUG_UIDZOEK */
+
+uint8_t SX1280_CheckRxDonePolling(void)
+{
+    ELRS_IQSweepTick();
+
+#if ELRS_DEBUG_UIDZOEK
+    ELRS_UidZoekTick();
+#endif
+
+    /* ----------------------------------------------------------------------
+     *  Levensteken vanuit de POLLING, niet vanuit de pakketafhandeling
+     * ----------------------------------------------------------------------
+     *  Komt er helemaal niets binnen, dan draaide de oude melding nooit en
+     *  keek je naar een leeg scherm zonder te weten of de chip iets hoort.
+     *  Deze regel komt er altijd, ook bij nul pakketten.
+     *
+     *  De preamble-teller is hier de sleutel. PreambleDetected staat in de
+     *  IRQ-mask, dus die telt op zodra de chip een LoRa-preamble herkent,
+     *  ook als het pakket daarna niet compleet wordt:
+     *
+     *    preambles lopen op, geen pakketten -> SF en bandbreedte kloppen,
+     *        maar iets in de packet params (lengte, coderate) niet
+     *    preambles blijven 0                -> SF, bandbreedte, IQ of
+     *        syncword klopt niet; de chip herkent niets als LoRa
+     * ---------------------------------------------------------------------- */
+#if ELRS_DEBUG_INDEXSWEEP
+    /* ----------------------------------------------------------------------
+     *  Index-sweep: staan we wel op de juiste plek in de tabel?
+     * ----------------------------------------------------------------------
+     *  Dit is de zwaarste knop. Klopt de tabel maar zitten we er een index
+     *  naast, dan luisteren we vrijwel altijd op de verkeerde frequentie en
+     *  haal je hooguit een paar procent. Klopt de tabel zelf niet, dan helpt
+     *  GEEN ENKELE offset en blijven alle standen even slecht. Precies dat
+     *  onderscheid meten we hier.
+     * ---------------------------------------------------------------------- */
+    {
+        #define IS_STANDEN  (ELRS_INDEXSWEEP_TOT - ELRS_INDEXSWEEP_VAN + 1)
+
+        static uint32_t is_tellingen[IS_STANDEN];
+        static uint32_t is_tijd = 0, is_start_pkt = 0;
+        static uint8_t  is_stand = 0;
+        static uint8_t  is_bezig = 0;
+
+        if (is_bezig == 0) {
+            /* Pas beginnen als de link echt staat, anders meet je ruis. */
+            if (elrs_link_state == ELRS_STATE_LOCKED && elrs_acq_bevestigd) {
+                is_bezig     = 1;
+                is_stand     = 0;
+                is_tijd      = HAL_GetTick();
+                is_start_pkt = elrs_packet_count;
+                elrs_index_offset = ELRS_INDEXSWEEP_VAN;
+                printf("\n=== INDEX-SWEEP: offset %d tot %d, %d s per stand ===\n",
+                       ELRS_INDEXSWEEP_VAN, ELRS_INDEXSWEEP_TOT,
+                       ELRS_INDEXSWEEP_MS / 1000);
+                printf("    even niets aanraken, dit duurt %d seconden\n\n",
+                       IS_STANDEN * ELRS_INDEXSWEEP_MS / 1000);
+            }
+        }
+        else if (is_bezig == 1 &&
+                 (HAL_GetTick() - is_tijd) >= ELRS_INDEXSWEEP_MS) {
+
+            /* Stand afsluiten. Bewust GEEN printf per stand: een regel van
+             * 60 tekens kost op 115200 baud ruim 5 ms, en dat is meer dan
+             * een heel pakketslot. De tabel komt in een keer aan het eind. */
+            is_tellingen[is_stand] = elrs_packet_count - is_start_pkt;
+            is_stand++;
+
+            if (is_stand >= IS_STANDEN) {
+                uint8_t  beste = 0;
+                uint32_t totaal = 0;
+
+                for (uint8_t k = 1; k < IS_STANDEN; k++)
+                    if (is_tellingen[k] > is_tellingen[beste]) beste = k;
+                for (uint8_t k = 0; k < IS_STANDEN; k++)
+                    totaal += is_tellingen[k];
+
+                printf("\n=== UITSLAG INDEX-SWEEP ===\n");
+                printf("  offset | pakketten in %d s\n", ELRS_INDEXSWEEP_MS / 1000);
+                printf("  -------+------------------\n");
+                for (uint8_t k = 0; k < IS_STANDEN; k++) {
+                    printf("   %+3d   |   %5lu %s\n",
+                           ELRS_INDEXSWEEP_VAN + k,
+                           (unsigned long)is_tellingen[k],
+                           (k == beste) ? "  <== beste" : "");
+                }
+
+                /* Duidt de uitslag zelf, anders staar je naar getallen. */
+                if (is_tellingen[beste] * IS_STANDEN > totaal * 2) {
+                    printf("\n  >>> Een stand springt eruit: offset %+d.\n",
+                           ELRS_INDEXSWEEP_VAN + beste);
+                    printf("  >>> De TABEL klopt dus, alleen de uitlijning was fout.\n");
+                    printf("  >>> Zet ELRS_INDEX_OFFSET op %d, ELRS_DEBUG_INDEXSWEEP op 0.\n\n",
+                           ELRS_INDEXSWEEP_VAN + beste);
+                } else {
+                    printf("\n  >>> Alle standen liggen dicht bij elkaar.\n");
+                    printf("  >>> Geen enkele uitlijning helpt, dus de FHSS-TABEL zelf\n");
+                    printf("  >>> klopt niet. De UID of de OTA-versie is dan verkeerd.\n\n");
+                }
+
+                elrs_index_offset = (int8_t)(ELRS_INDEXSWEEP_VAN + beste);
+                is_bezig = 2;                 /* klaar, nooit opnieuw */
+            }
+            else {
+                elrs_index_offset = (int8_t)(ELRS_INDEXSWEEP_VAN + is_stand);
+                is_tijd      = HAL_GetTick();
+                is_start_pkt = elrs_packet_count;
+            }
+        }
+    }
+#endif
+
+#if ELRS_DEBUG_FASESWEEP
+    /* ----------------------------------------------------------------------
+     *  Fase-sweep: zoek de beste hopfase automatisch
+     * ----------------------------------------------------------------------
+     *  Zodra de link staat, lopen we de hele slotduur af in stapjes en tellen
+     *  per stand hoeveel pakketten er binnenkomen.
+     *
+     *  De vorige versie had hier een fout die de uitslag waardeloos maakte:
+     *  zodra de laatste stand klaar was bleef de tak vuren, want fs_tijd en
+     *  fs_start_pkt werden niet meer bijgewerkt. Het gevolg was dat de teller
+     *  ONBEPERKT doorliep en de laatste stand dus altijd "won", en dat er
+     *  eindeloos werd geprint. Dat printen slokte op zijn beurt de hele
+     *  main-loop op, waardoor de teller vastliep -- vandaar dat je die 3800
+     *  eerst zag oplopen en daarna bevriezen.
+     * ---------------------------------------------------------------------- */
+    {
+        #define FS_STANDEN  ((int)(ELRS_PACKET_INTERVAL_US / ELRS_FASESWEEP_STAP))
+
+        static uint32_t fs_tellingen[FS_STANDEN];
+        static uint32_t fs_tijd = 0, fs_start_pkt = 0;
+        static uint8_t  fs_stand = 0;
+        static uint8_t  fs_bezig = 0;
+
+        if (fs_bezig == 0) {
+            if (elrs_link_state == ELRS_STATE_LOCKED && elrs_acq_bevestigd) {
+                fs_bezig     = 1;
+                fs_stand     = 0;
+                fs_tijd      = HAL_GetTick();
+                fs_start_pkt = elrs_packet_count;
+                ELRS_ZetFaseOffset(0);
+                printf("\n=== FASE-SWEEP: 0 tot %u us in stappen van %d ===\n",
+                       (unsigned)ELRS_PACKET_INTERVAL_US, ELRS_FASESWEEP_STAP);
+                printf("    even niets aanraken, dit duurt %d seconden\n\n",
+                       FS_STANDEN * ELRS_FASESWEEP_MS / 1000);
+            }
+        }
+        else if (fs_bezig == 1 &&
+                 (HAL_GetTick() - fs_tijd) >= ELRS_FASESWEEP_MS) {
+
+            fs_tellingen[fs_stand] = elrs_packet_count - fs_start_pkt;
+            fs_stand++;
+
+            if (fs_stand >= FS_STANDEN) {
+                uint8_t beste = 0;
+                for (uint8_t k = 1; k < FS_STANDEN; k++)
+                    if (fs_tellingen[k] > fs_tellingen[beste]) beste = k;
+
+                printf("\n=== UITSLAG FASE-SWEEP ===\n");
+                printf("  offset | pakketten in %d s\n", ELRS_FASESWEEP_MS / 1000);
+                printf("  -------+------------------\n");
+                for (uint8_t k = 0; k < FS_STANDEN; k++) {
+                    printf("  %5d  |   %5lu %s\n",
+                           k * ELRS_FASESWEEP_STAP,
+                           (unsigned long)fs_tellingen[k],
+                           (k == beste) ? "  <== beste" : "");
+                }
+                printf("\n  >>> Zet ELRS_FASE_OFFSET_US op %d en "
+                       "ELRS_DEBUG_FASESWEEP op 0.\n\n",
+                       beste * ELRS_FASESWEEP_STAP);
+
+                ELRS_ZetFaseOffset((int32_t)beste * ELRS_FASESWEEP_STAP);
+                fs_bezig = 2;                 /* klaar, nooit opnieuw */
+            }
+            else {
+                ELRS_ZetFaseOffset((int32_t)fs_stand * ELRS_FASESWEEP_STAP);
+                fs_tijd      = HAL_GetTick();
+                fs_start_pkt = elrs_packet_count;
+            }
+        }
+    }
+#endif
+
+    {
+        static uint32_t hb_tijd = 0;
+        static uint32_t hb_pakketten = 0;
+
+        if ((HAL_GetTick() - hb_tijd) > 3000) {
+            hb_tijd = HAL_GetTick();
+
+            /* Ruwe aantallen zeggen weinig; een percentage van wat er in die
+             * drie seconden HAD kunnen binnenkomen zegt alles. Dat is precies
+             * wat ELRS zelf "link quality" noemt. */
+            uint32_t nieuw    = elrs_packet_count - hb_pakketten;
+            uint32_t verwacht = 3000000UL / ELRS_PACKET_INTERVAL_US;
+            uint32_t lq       = (nieuw * 100UL) / verwacht;
+            if (lq > 100) lq = 100;
+            elrs_lq = (uint8_t)lq;
+
+            printf("[%s] LQ %3lu%%  (%lu van %lu)  RSSI %d dBm%s\n",
+                   (elrs_link_state == ELRS_STATE_LOCKED) ? "gelockt" : "zoekt  ",
+                   (unsigned long)lq, (unsigned long)nieuw,
+                   (unsigned long)verwacht, SX1280_GetRssiInst(),
+                   elrs_failsafe ? "   [FAILSAFE]" : "");
+            hb_pakketten = elrs_packet_count;
+        }
+    }
+
+#if !ELRS_DEBUG_PHY
+    /* Waakhond: 500 ms geen geldig pakket -> link kwijt, terug naar zoeken. */
+    /* Zolang de kandidaat-index nog niet bewezen is, geven we hem maar kort
+     * de tijd. Klopt hij, dan komen er meteen pakketten. Klopt hij niet, dan
+     * willen we snel de volgende proberen in plaats van seconden te wachten. */
+    uint32_t grens = elrs_acq_bevestigd ? ELRS_TIMEOUT_MS : ELRS_ACQ_PROBEER_MS;
+
+    if (elrs_link_state == ELRS_STATE_LOCKED &&
+        (HAL_GetTick() - last_packet_time) > grens)
+    {
+        elrs_link_state = ELRS_STATE_SEARCHING;
+        is_synchronized = 0;
+        elrs_anker_van_sync = 0;
+        ELRS_ZetFailsafe();          /* gas dicht, assen neutraal */
+        ELRS_PhaseReset();
+        HAL_TIM_Base_Stop_IT(&htim3);
+
+        if (elrs_acq_bevestigd) {
+            printf("\n!!! verbinding verloren, terug naar kanaal %d !!!\n\n",
+                   ELRS_SYNC_CHANNEL);
+            elrs_acq_poging = 0;
+        } else {
+            printf("poging %u van %u mislukt (%u geldige pakketten), "
+                   "volgende kandidaat\n",
+                   (unsigned)((elrs_acq_poging % ELRS_ACQ_KANDIDATEN) + 1),
+                   (unsigned)ELRS_ACQ_KANDIDATEN, elrs_acq_teller);
+            elrs_acq_poging = (uint8_t)((elrs_acq_poging + 1)
+                                        % ELRS_ACQ_KANDIDATEN);
+        }
+        elrs_acq_bevestigd = 0;
+
+        SX1280_SetRfFrequency(ELRS_SYNC_FREQ);
+        SX1280_SetRx();
+        last_packet_time = HAL_GetTick();
+    }
+#endif
+
+    uint8_t tx_buf[4] = {SX1280_GETIRQSTATUS, 0x00, 0x00, 0x00};
+    uint8_t rx_buf[4] = {0};
+
+    if (SX1280_BUSY() == 1) return 0;
+
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, tx_buf, rx_buf, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    uint16_t irq_status = (rx_buf[2] << 8) | rx_buf[3];
+
+    if (irq_status != 0) {
+        uint8_t clrIrq[3] = {SX1280_CLRIRQSTATUS, 0xFF, 0xFF};
+        SX1280_Select();
+        HAL_SPI_Transmit(&hspi2, clrIrq, 3, HAL_MAX_DELAY);
+        SX1280_Deselect();
+    }
+
+    if (irq_status & SX1280_IRQ_PREAMBLE_DETECTED) elrs_preamble_count++;
+
+    if (irq_status & SX1280_IRQ_RX_DONE) return 1;
+    return 0;
+}
+
+/* ==========================================================================
+ *  ELRS CRC14
+ *  Referentie: ELRS crc.cpp, Crc2Byte::init(14, ELRS_CRC14_POLY)
+ * ========================================================================== */
+static uint16_t elrs_crc_table[256];
+
+void ELRS_InitCRC(void)
+{
+    uint16_t poly    = ELRS_CRC14_POLY;
+    uint16_t highbit = 1 << 13;
+
+    for (uint16_t i = 0; i < 256; i++) {
+        uint16_t crc = i << 6;               /* i << (bits - 8) */
+        for (uint8_t j = 0; j < 8; j++) {
+            crc = (crc << 1) ^ ((crc & highbit) ? poly : 0);
+        }
+        elrs_crc_table[i] = crc & 0x3FFF;    /* & bitmask, zoals in ELRS */
+    }
+}
+
+uint16_t ELRS_CalculateCRC(uint8_t *data, uint8_t len, uint16_t seed)
+{
+    uint16_t crc = seed;
+    for (uint8_t i = 0; i < len; i++) {
+        crc = (crc << 8) ^ elrs_crc_table[((crc >> 6) ^ data[i]) & 0xFF];
+    }
+    return crc & 0x3FFF;
+}
+
+/* ==========================================================================
+ *  Pakket valideren tegen alle bekende seeds
+ * ==========================================================================
+ *  Jouw firmware (master d84313) gebruikt drie verschillende CRC-seeds:
+ *  0x07A1 voor SYNC en 0x06A1 / 0x05A1 voor RC-data. Dat is uit je eigen
+ *  ontvangen pakketten gemeten. In plaats van te gokken welke wanneer geldt,
+ *  proberen we ze alle drie. Met drie kandidaten op een 14-bits CRC is de
+ *  kans op een toevallige match 0,018% per pakket, dus dat kost niets.
+ * ========================================================================== */
+uint8_t ELRS_ValidatePacket(uint8_t *calc_buffer, uint16_t ontvangen_crc,
+                            uint16_t *gebruikt)
+{
+#if ELRS_NONCE_IN_CRC
+    /* ELRS 3.x en 4.x: OtaCrcInitializer ^ nonce, en voor SYNC is de nonce 0.
+     *     bool ValidatePacketCrcStd(...) {
+     *         nonceValidator = (type == PACKET_TYPE_SYNC) ? 0 : OtaNonce;
+     *         crc = calc(pkt, len, OtaCrcInitializer ^ nonceValidator);
+     *     }
+     *
+     * SYNC heeft dus maar EEN kandidaat: kans op toeval 1 op 16384.
+     * Voor RC-data kennen we de nonce nog niet en lopen we alle 256 af. */
+    if ((calc_buffer[0] & 0x03) == ELRS_PKT_SYNC) {
+        if (ELRS_CalculateCRC(calc_buffer, ELRS_CRC_CALC_LEN, ELRS_CRC_INIT)
+            == ontvangen_crc) {
+            if (gebruikt) *gebruikt = ELRS_CRC_INIT;
+            return 1;
+        }
+        return 0;
+    }
+
+    for (uint16_t n = 0; n < 256; n++) {
+        uint16_t s = (uint16_t)(ELRS_CRC_INIT ^ n);
+        if (ELRS_CalculateCRC(calc_buffer, ELRS_CRC_CALC_LEN, s) == ontvangen_crc) {
+            if (gebruikt) *gebruikt = s;
+            return 1;
+        }
+    }
+    return 0;
+
+#elif ELRS_SEED_BRUTE_HI
+    /* De lage byte ligt vast, de hoge 6 bits varieren met de nonce.
+     * 64 kandidaten aflopen kost bijna niets. */
+    for (uint8_t hi = 0; hi < 64; hi++) {
+        uint16_t s = (uint16_t)(((uint16_t)hi << 8) | ELRS_SEED_LO);
+        if (ELRS_CalculateCRC(calc_buffer, ELRS_CRC_CALC_LEN, s) == ontvangen_crc) {
+            if (gebruikt) *gebruikt = s;
+            return 1;
+        }
+    }
+    return 0;
+#else
+    static const uint16_t seeds[ELRS_SEED_AANTAL] = ELRS_SEED_LIJST;
+
+    for (uint8_t i = 0; i < ELRS_SEED_AANTAL; i++) {
+        if (ELRS_CalculateCRC(calc_buffer, ELRS_CRC_CALC_LEN, seeds[i]) == ontvangen_crc) {
+            if (gebruikt) *gebruikt = seeds[i];
+            return 1;
+        }
+    }
+    return 0;
+#endif
+}
+
+/* ==========================================================================
+ *  Kanalen uitpakken
+ *  ELRS OTA.cpp -> UnpackChannels4x10ToUInt11(). 4 kanalen van 10 bit,
+ *  little-endian gepakt in payload[1..5]. Resultaat is 0..1023.
+ * ========================================================================== */
+void ELRS_UnpackChannels(uint8_t *payload, uint16_t *channels)
+{
+    uint32_t readValue = 0;
+    uint8_t  bitsMerged = 0;
+    uint8_t  readByteIndex = 1;   /* byte 0 is type + crcHigh */
+
+    for (uint8_t n = 0; n < 4; n++) {
+        while (bitsMerged < 10) {
+            readValue |= ((uint32_t)payload[readByteIndex++]) << bitsMerged;
+            bitsMerged += 8;
+        }
+        channels[n] = readValue & 0x03FF;
+        readValue >>= 10;
+        bitsMerged -= 10;
+    }
+}
+
+/* ==========================================================================
+ *  Timing: nonce en FHSS
+ * ==========================================================================
+ *  ELRS laat de nonce oplopen met elk pakket-interval (20 ms bij 50 Hz) en
+ *  hopt wanneer (nonce + 1) % FHSShopInterval == 0. TIM3 moet dus op 20 ms
+ *  blijven staan, niet op 40 ms: de nonce heeft elke tick nodig.
+ *
+ *  LET OP DE VOLGORDE. ELRS doet dit in rx_main.cpp:
+ *
+ *      void HWtimerCallbackTick() {
+ *          bool didFHSS = HandleFHSS();     // test (OtaNonce + 1) % interval
+ *          ...
+ *          OtaNonce++;                      // PAS HIERNA ophogen
+ *      }
+ *
+ *  Dus ELRS test de nonce van het slot dat NET AFGELOPEN is en hopt als het
+ *  volgende slot een veelvoud van het interval wordt. Hier werd eerst
+ *  opgehoogd en daarna alsnog op (nonce + 1) getest -- effectief (nonce + 2).
+ *  Daarmee sprong de ontvanger elke keer een heel slot te vroeg. Nagerekend
+ *  kwam dat neer op hooguit 25% van de pakketten op het goede kanaal.
+ *
+ *  Na het ophogen is elrs_nonce de nonce van het slot dat gaat KOMEN, dus de
+ *  test hoort simpelweg (nonce % interval) == 0 te zijn.
+ * ========================================================================== */
+void ELRS_Tick(void)
+{
+    elrs_nonce++;
+    elrs_ticks++;
+
+    if ((elrs_nonce % ELRS_FHSS_HOP_INTERVAL) != 0) return;
+
+    /* ----------------------------------------------------------------------
+     *  Hoppen vanuit de interrupt
+     * ----------------------------------------------------------------------
+     *  Bij 250 Hz zit er maar 0,67 ms tussen twee pakketten om van kanaal te
+     *  wisselen. De main-loop haalt dat niet: een enkele printf-regel duurt
+     *  bij 115200 baud al 7 ms. Vandaar dat de frequentiewissel hier gebeurt,
+     *  direct op de tik van de timer.
+     *
+     *  Loopt er net een SPI-transactie, dan blijven we eraf en geven we het
+     *  door aan de main-loop. Die transacties duren ongeveer 50 us, dus dat
+     *  gebeurt zelden en kost dan weinig.
+     * ---------------------------------------------------------------------- */
+    if (elrs_spi_bezig) {
+        elrs_do_hop = 1;
+    } else {
+        ELRS_HandleHop();
+    }
+}
+
+/* --------------------------------------------------------------------------
+ *  Phase lock op de zender
+ * --------------------------------------------------------------------------
+ *  Je draait nu op HSE (16 MHz kristal). Daarmee is de klokDRIFT geen punt
+ *  meer: een kristal doet 10 a 30 ppm, oftewel minder dan 1 us afwijking per
+ *  tick van 20 ms. Met HSI (~1%, dus 200 us per tick) was dit onmisbaar.
+ *
+ *  Toch blijft dit staan, want HSE lost een tweede probleem NIET op:
+ *
+ *  Je start TIM3 pas op het moment dat je het sync-pakket verwerkt hebt. Dat
+ *  is later dan het moment waarop het binnenkwam: de main-loop moet eerst
+ *  langs de polling en er komen een paar SPI-reads overheen. Die vertraging
+ *  is al gauw 1 a 3 ms en verdwijnt nooit vanzelf. Je hops liggen dan
+ *  permanent scheef ten opzichte van de zender, wat je marge opeet binnen het
+ *  venster van ~7 ms dat een pakket in beslag neemt.
+ *
+ *  Deze versie kalibreert zichzelf: het eerste geldige pakket na een lock
+ *  legt vast waar in de timer-cyclus pakketten horen aan te komen, en daarna
+ *  wordt er alleen nog zacht bijgestuurd (1/8 van de fout per pakket). Er valt
+ *  dus niets meer met de hand af te stemmen.
+ *
+ *  Dat referentiepunt klopt structureel altijd: het wordt vastgelegd NADAT
+ *  het pakket binnen is, dus de hop valt gegarandeerd in het gat tussen twee
+ *  pakketten, wat de exacte waarde ook wordt.
+ *
+ *  TIM3 telt 1 tick per microseconde (108 MHz / (107+1)), dus de tellerstand
+ *  IS het aantal microseconden sinds de laatste tick.
+ */
+#define ELRS_DEBUG_PHASE        0
+
+static uint8_t phase_gekalibreerd = 0;
+static int32_t phase_target       = 0;
+
+/* Runtime-versie van de fase-offset, zodat de sweep hem kan verzetten. */
+volatile int32_t elrs_fase_offset = ELRS_FASE_OFFSET_US;
+
+/* Idem voor de index-offset. */
+volatile int8_t elrs_index_offset = ELRS_INDEX_OFFSET;
+
+void ELRS_PhaseReset(void)
+{
+    phase_gekalibreerd = 0;
+}
+
+/* Verschuif het referentiepunt naar een nieuwe offset zonder opnieuw te
+ * kalibreren. Het verschil tussen oud en nieuw wordt gewoon opgeteld. */
+void ELRS_ZetFaseOffset(int32_t nieuw)
+{
+    if (!phase_gekalibreerd) { elrs_fase_offset = nieuw; return; }
+
+    phase_target += (nieuw - elrs_fase_offset);
+    while (phase_target < 0)                                phase_target += (int32_t)ELRS_PACKET_INTERVAL_US;
+    while (phase_target >= (int32_t)ELRS_PACKET_INTERVAL_US) phase_target -= (int32_t)ELRS_PACKET_INTERVAL_US;
+    elrs_fase_offset = nieuw;
+}
+
+static void ELRS_PhaseLock(void)
+{
+    int32_t nu = (int32_t)__HAL_TIM_GET_COUNTER(&htim3);
+
+    if (!phase_gekalibreerd) {
+        /* Eerste geldige pakket na de lock legt het referentiepunt vast.
+         * De offset schuift het punt op zodat de hop niet op de preamble van
+         * het volgende pakket valt maar in het gat ervoor. */
+        phase_target = nu + elrs_fase_offset;
+        while (phase_target >= (int32_t)ELRS_PACKET_INTERVAL_US)
+            phase_target -= (int32_t)ELRS_PACKET_INTERVAL_US;
+        phase_gekalibreerd = 1;
+#if ELRS_DEBUG_PHASE
+        printf("phase target vastgelegd op %ld us\n", (long)phase_target);
+#endif
+        return;
+    }
+
+    int32_t fout = nu - phase_target;
+    if (fout >  (int32_t)(ELRS_PACKET_INTERVAL_US / 2)) fout -= (int32_t)ELRS_PACKET_INTERVAL_US;
+    if (fout < -(int32_t)(ELRS_PACKET_INTERVAL_US / 2)) fout += (int32_t)ELRS_PACKET_INTERVAL_US;
+
+#if ELRS_DEBUG_PHASE
+    printf("phase: nu=%ld target=%ld fout=%ld us\n", (long)nu, (long)phase_target, (long)fout);
+#endif
+
+    /* Met een kristal is de fout klein, dus zacht corrigeren. Zo laat je je
+     * niet gek maken door de jitter van de polling-loop. */
+    int32_t nieuw = nu - (fout / 8);
+    while (nieuw < 0)                                  nieuw += (int32_t)ELRS_PACKET_INTERVAL_US;
+    while (nieuw >= (int32_t)ELRS_PACKET_INTERVAL_US)  nieuw -= (int32_t)ELRS_PACKET_INTERVAL_US;
+
+    __HAL_TIM_SET_COUNTER(&htim3, (uint32_t)nieuw);
+}
+
+void ELRS_HandleHop(void)
+{
+    elrs_do_hop = 0;
+
+    /* De UID-zoeker wil juist op een vast kanaal blijven staan. */
+    if (elrs_hop_pauze) return;
+
+#if ELRS_DEBUG_PHY || !ELRS_HOP_ENABLE
+    /* Blijven staan. Met ELRS_HOP_ENABLE op 0 controleren we eerst of de
+     * TIMING klopt: de nonce moet gelijk blijven lopen met de zender, en dat
+     * kunnen we aflezen uit de hoge bits van de seed. Pas als dat klopt heeft
+     * het zin om de FHSS-tabel te vertrouwen. */
+    return;
+#else
+    /* ----------------------------------------------------------------------
+     *  Index UITREKENEN, niet ophogen
+     * ----------------------------------------------------------------------
+     *  elrs_do_hop was een vlaggetje. Verstreken er twee hops voordat de
+     *  main-loop erbij kwam, dan hopte je maar een keer en liep de index
+     *  daarna PERMANENT achter. Bij 50 Hz zeldzaam, bij 250 Hz elke keer dat
+     *  er een printf tussendoor komt: die duurt 7 ms terwijl er elke 16 ms
+     *  een hop is.
+     *
+     *  Nu leiden we de index af van de nonce, die in de timer-interrupt
+     *  wordt opgehoogd en dus nooit een tik mist. Een gemiste hop herstelt
+     *  zichzelf daarmee vanzelf.
+     * ---------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     *  Index uit de ABSOLUTE nonce, niet uit het tikverschil
+     * ----------------------------------------------------------------------
+     *  De zender wisselt van index wanneer zijn nonce een veelvoud van het
+     *  hop-interval wordt. Zijn index is dus:
+     *
+     *      index(n) = anker_index + floor(n / 4) - floor(anker_nonce / 4)
+     *
+     *  Hier stond floor((n - anker_nonce) / 4), en dat is IETS ANDERS zodra
+     *  anker_nonce zelf geen veelvoud van 4 is. Het verschil is dan geen
+     *  vaste verschuiving maar wisselt binnen elke groep van vier pakketten,
+     *  en juist daarom kon de index-sweep het niet vinden: een constante
+     *  correctie bestaat er niet voor.
+     *
+     *  De nonce is 8 bits en wrapt op 256. Omdat 4 een deler van 256 is, mag
+     *  je gewoon met die 8 bits rekenen: floor(n/4) klopt dan modulo 64.
+     * ---------------------------------------------------------------------- */
+    uint32_t verstreken = elrs_ticks - elrs_anker_ticks;
+    uint32_t nonce_abs  = (uint32_t)elrs_anker_nonce + verstreken;
+
+    int32_t  idx = (int32_t)elrs_anker_index
+                 + (int32_t)(nonce_abs / ELRS_FHSS_HOP_INTERVAL)
+                 - (int32_t)(elrs_anker_nonce / ELRS_FHSS_HOP_INTERVAL)
+                 + (int32_t)elrs_index_offset;
+
+    /* Modulo met een negatieve offset: eerst optellen zodat idx nooit
+     * negatief de modulo in gaat, want C rondt dan naar nul en dat geeft
+     * een negatieve index in de tabel. */
+    idx %= (int32_t)ELRS_SEQUENCE_COUNT;
+    if (idx < 0) idx += (int32_t)ELRS_SEQUENCE_COUNT;
+
+    fhss_index = (uint8_t)idx;
+
+    uint32_t nieuwe_frequentie = ELRS_FREQ_START
+                               + (uint32_t)fhss_sequence[fhss_index] * ELRS_FREQ_STEP_HZ;
+
+    SX1280_SetRfFrequency(nieuwe_frequentie);
+    SX1280_SetRx();
+#endif
+}
+
+/* ==========================================================================
+ *  Pakketverwerking
+ * ========================================================================== */
+void SX1280_OnPacketReceived(void)
+{
+    uint8_t buf[4] = {SX1280_GETRXBUFFERSTATUS, 0x00, 0x00, 0x00};
+    uint8_t status[4] = {0};
+
+    SX1280_BUSY();
+    SX1280_Select();
+    HAL_SPI_TransmitReceive(&hspi2, buf, status, 4, HAL_MAX_DELAY);
+    SX1280_Deselect();
+
+    /* status[2] = rxPayloadLength, status[3] = rxStartBufferPointer
+     * (datasheet 11.8.1).
+     *
+     * LET OP: bij implicit header is een lengte van 0 NORMAAL. Datasheet p.92:
+     *   "In LoRa packet type with fixed header the GetRxBufferStatus always
+     *    returns 0x00 for rxPayloadLength."
+     * Er zit immers geen header in het pakket, dus de lengte valt er niet uit
+     * af te leiden. We lezen gewoon de ingestelde ELRS_PACKET_SIZE bytes.
+     * Alleen een pointer die niet 0 is zou een probleem zijn. */
+    uint8_t offset = status[3];
+    uint8_t payload[ELRS_PACKET_SIZE] = {0};
+
+    SX1280_ReadBuffer(offset, payload, ELRS_PACKET_SIZE);
+    elrs_packet_count++;
+
+    {
+        static uint8_t buffer_gemeld = 0;
+        if (!buffer_gemeld && offset != 0) {
+            buffer_gemeld = 1;
+            printf("\n!! rxStartBufferPointer = %u, verwacht 0\n\n", offset);
+        }
+    }
+
+    /* Byte 0 = type (bit 0-1) + crcHigh (bit 2-7), byte 7 = crcLow. */
+    uint8_t  packetType    = payload[0] & 0x03;
+    uint16_t ontvangen_crc = ((uint16_t)(payload[0] >> 2) << 8) | payload[7];
+
+    /* ELRS berekent de CRC met crcHigh op nul. */
+    uint8_t calc_buffer[ELRS_CRC_CALC_LEN];
+    for (int i = 0; i < ELRS_CRC_CALC_LEN; i++) calc_buffer[i] = payload[i];
+    calc_buffer[0] &= 0x03;
+
+#if ELRS_DEBUG_SEED
+    /* ==================================================================
+     *  SEED-ANALYSE
+     * ==================================================================
+     *  Reken terug welke seed deze CRC geproduceerd moet hebben. De map
+     *  seed -> crc is voor vaste data een bijectie, dus er is precies een
+     *  oplossing. Bits 14 en 15 van de seed doen niet mee (die schuiven er
+     *  in de eerste ronde uit), dus 16384 kandidaten volstaat.
+     * ================================================================== */
+    static uint16_t hist6[64];              /* bovenste 6 bits, alle pakketten */
+    static uint8_t  nonce_bitmap[64][32];   /* welke lage seed-bytes per bin gezien */
+    static uint16_t type_tel[4];
+    static uint16_t sync_seed[16];          /* volledige seeds van SYNC-pakketten */
+    static uint8_t  sync_pl[16][ELRS_CRC_CALC_LEN];
+    static uint8_t  sync_n = 0;
+    static int8_t   seed_beste_rssi = -128;
+    static uint8_t  gezien[8192];           /* bitmap op 16-bit hash van de payload */
+    static uint32_t dubbel_tel = 0;
+    static uint32_t uniek_tel  = 0;
+
+    /* Statistiek per IQ-stand: [0] = normaal (0x40), [1] = omgedraaid (0x00) */
+    static uint32_t iq_pakketten[2];
+    static int8_t   iq_max_snr[2]  = {-128, -128};
+    static int8_t   iq_max_rssi[2] = {-128, -128};
+    static uint16_t iq_treffer_v3[2];
+    static uint16_t iq_treffer_v4[2];
+#if ELRS_IQ_SWEEP
+    static uint32_t iq_rapport_tijd = 0;
+#endif
+
+    int8_t seed_rssi = 0, seed_snr = 0;
+    SX1280_GetPacketStatus(&seed_rssi, &seed_snr);
+    if (seed_rssi > seed_beste_rssi) seed_beste_rssi = seed_rssi;
+
+    uint8_t iqi = (elrs_iq_actueel == SX1280_LORA_IQ_NORMAL) ? 0 : 1;
+    iq_pakketten[iqi]++;
+    if (seed_snr  > iq_max_snr[iqi])  iq_max_snr[iqi]  = seed_snr;
+    if (seed_rssi > iq_max_rssi[iqi]) iq_max_rssi[iqi] = seed_rssi;
+
+    /* ----------------------------------------------------------------------
+     *  DUBBELE PAYLOADS WEGGOOIEN
+     * ----------------------------------------------------------------------
+     *  De demodulator produceert uit ruis steeds dezelfde handvol patronen.
+     *  Identieke bytes geven identieke CRC en dus identieke seed, en dat
+     *  bouwt een nepPiek op in het histogram. Precies wat er gebeurde bij
+     *  0x05: 453 treffers uit maar 23 verschillende nonces.
+     *
+     *  Een ECHT ELRS-pakket kan praktisch nooit twee keer identiek zijn: de
+     *  nonce loopt op, dus de CRC verandert, dus byte 0 en byte 7 veranderen
+     *  mee, zelfs als je de sticks niet aanraakt. Exacte duplicaten
+     *  weggooien kost dus geen echte data en haalt de ruispiek eruit.
+     * ---------------------------------------------------------------------- */
+    {
+        uint32_t f = 2166136261u;                   /* FNV-1a */
+        for (int k = 0; k < ELRS_PACKET_SIZE; k++) { f ^= payload[k]; f *= 16777619u; }
+        uint16_t h = (uint16_t)(f ^ (f >> 16));
+
+        /* Pakketten waar de demodulator echt op vergrendeld heeft slaan we
+         * nooit over, ook niet als de hash toevallig botst met eerder geziene
+         * ruis. Die zijn te kostbaar om weg te gooien. */
+        if ((gezien[h >> 3] & (uint8_t)(1u << (h & 7)))
+            && seed_snr < ELRS_SEED_SNR_PRINT) {
+            dubbel_tel++;
+            SX1280_SetRx();
+            return;
+        }
+        gezien[h >> 3] |= (uint8_t)(1u << (h & 7));
+        uniek_tel++;
+    }
+
+    type_tel[packetType]++;
+
+    int32_t gevonden = -1;
+    for (uint32_t s = 0; s < 16384; s++) {
+        if (ELRS_CalculateCRC(calc_buffer, ELRS_CRC_CALC_LEN, (uint16_t)s) == ontvangen_crc) {
+            gevonden = (int32_t)s;
+            break;
+        }
+    }
+
+    if (gevonden >= 0) {
+        uint8_t hi = (uint8_t)((gevonden >> 8) & 0x3F);
+        uint8_t lo = (uint8_t)(gevonden & 0xFF);
+
+        /* ------------------------------------------------------------------
+         *  ECHTE PAKKETTEN DIRECT UITPRINTEN
+         * ------------------------------------------------------------------
+         *  Alleen pakketten waar de demodulator echt op vergrendeld heeft.
+         *  Ruis komt nooit boven +2 dB SNR, dus alles hierboven is een echt
+         *  LoRa-pakket van je zender. Daar hebben we er maar een paar van
+         *  nodig om te zien of UID en OTA-versie kloppen: de bovenste 6 bits
+         *  van de seed horen bij ALLE echte pakketten hetzelfde te zijn.
+         * ------------------------------------------------------------------ */
+        if (seed_snr >= ELRS_SEED_SNR_PRINT) {
+            static uint16_t echt_tel = 0;
+            static uint8_t  echt_hi[8];
+            static uint8_t  echt_n = 0;
+
+            uint16_t ch[4];
+            ELRS_UnpackChannels(payload, ch);
+
+            echt_tel++;
+            printf("ECHT #%u  SNR %+3d  RSSI %4d  type %d  CH %4u %4u %4u %4u  | ",
+                   echt_tel, seed_snr, seed_rssi, packetType,
+                   ch[0], ch[1], ch[2], ch[3]);
+            for (int k = 0; k < ELRS_PACKET_SIZE; k++) printf("%02X ", payload[k]);
+            printf(" seed 0x%04lX  bits[13:8]=0x%02X%s",
+                   (unsigned long)gevonden, hi,
+                   ((uint16_t)gevonden == ELRS_CRC_INIT) ? "  <== MATCHT ONZE SEED" : "");
+
+            /* Welke OTA-versie zou hier bij jouw UID4 uit volgen? */
+            for (uint8_t v = 0; v <= 15; v++) {
+                if (((ELRS_UID4 ^ v) & 0x3F) == hi) { printf("  -> OTA_VERSION %u", v); break; }
+            }
+            if (packetType == ELRS_PKT_SYNC) {
+                printf("  SYNC: fhss=%u nonce=%u UID4=%u UID5=%u",
+                       payload[1], payload[2], payload[5], payload[6]);
+            }
+            printf("\n");
+
+            /* Zijn de bovenste bits consistent over de echte pakketten? */
+            if (echt_n < 8) echt_hi[echt_n++] = hi;
+            if (echt_n == 8) {
+                uint8_t gelijk = 1;
+                for (uint8_t k = 1; k < 8; k++) if (echt_hi[k] != echt_hi[0]) gelijk = 0;
+                echt_n = 0;
+                printf(gelijk
+                    ? "   ^^^ 8 echte pakketten met DEZELFDE bovenste bits: dat is je UID\n"
+                    : "   ^^^ 8 echte pakketten met VERSCHILLENDE bovenste bits: nog bitfouten\n");
+            }
+        }
+
+        hist6[hi]++;
+        nonce_bitmap[hi][lo >> 3] |= (uint8_t)(1u << (lo & 7));
+
+        if (hi == (uint8_t)((ELRS_UID4 ^ 3) & 0x3F)) iq_treffer_v3[iqi]++;
+        if (hi == (uint8_t)((ELRS_UID4 ^ 4) & 0x3F)) iq_treffer_v4[iqi]++;
+
+        /* ------------------------------------------------------------------
+         *  ZELFCONTROLE OP SYNC-PAKKETTEN  --  dit is de sluitende test
+         * ------------------------------------------------------------------
+         *  De ELRS sync-payload (OTA_Sync_s) draagt UID4 en UID5 gewoon mee,
+         *  op byte 5 en byte 6. Dat geldt voor zowel 3.x als 4.x; alleen de
+         *  bytes ertussen verschillen.
+         *
+         *  Voor een SYNC-pakket is de nonce 0, dus de teruggerekende seed IS
+         *  de OtaCrcInitializer zelf:
+         *      seed = ((UID4 ^ OTA_VERSION) << 8) | UID5     (bits 13:0)
+         *
+         *  Dus: als payload[6] gelijk is aan de lage byte van de seed, EN er
+         *  bestaat een OTA-versie waarvoor payload[5] met de hoge bits klopt,
+         *  dan is dit met zekerheid een echt pakket van een echte zender.
+         *  Kans dat ruis dit toevallig doet: 1 op 256 x 64 = 1 op 16384.
+         *
+         *  Bijkomend voordeel: je leest hier de VOLLEDIGE UID4 af (8 bits),
+         *  niet alleen de lage 6 bits, en je krijgt de OTA-versie erbij.
+         * ------------------------------------------------------------------ */
+        if (packetType == ELRS_PKT_SYNC && payload[6] == lo
+            && ELRS_FHSSIDX_OK(payload[1])) {
+            for (uint8_t v = 2; v <= 6; v++) {
+                if (((payload[5] ^ v) & 0x3F) != hi) continue;
+
+                printf("\n########## ECHT SYNC-PAKKET GEVONDEN ##########\n");
+                printf("  payload : ");
+                for (int k = 0; k < ELRS_PACKET_SIZE; k++) printf("%02X ", payload[k]);
+                printf("\n");
+                printf("  seed          = 0x%04lX  (= OtaCrcInitializer)\n",
+                       (unsigned long)gevonden);
+                printf("  OTA_VERSION   = %u\n", v);
+                printf("  UID[4]        = %u\n", payload[5]);
+                printf("  UID[5]        = %u\n", payload[6]);
+                printf("  fhssIndex     = %u\n", payload[1]);
+                printf("  nonce         = %u\n", payload[2]);
+                printf("  --- nu ingesteld: OTA_VERSION=%d UID4=%d UID5=%d ---\n",
+                       ELRS_OTA_VERSION, ELRS_UID4, ELRS_UID5);
+                printf("###############################################\n\n");
+                break;
+            }
+        }
+
+        if (packetType == ELRS_PKT_SYNC) {
+            uint8_t gevonden_in_tabel = 0;
+
+            for (uint8_t i = 0; i < sync_n && !gevonden_in_tabel; i++) {
+                if (sync_seed[i] != (uint16_t)gevonden) continue;
+                gevonden_in_tabel = 1;
+
+                /* Zelfde seed alleen is niet genoeg. De demodulator spuugt
+                 * regelmatig exact hetzelfde ruispatroon uit, en identieke
+                 * bytes geven per definitie dezelfde CRC en dus dezelfde
+                 * seed. Dat was de fout in de vorige versie. Pas als de
+                 * PAYLOAD verschilt is het echt bewijs. */
+                uint8_t zelfde_payload = 1;
+                for (uint8_t k = 0; k < ELRS_CRC_CALC_LEN; k++) {
+                    if (sync_pl[i][k] != calc_buffer[k]) { zelfde_payload = 0; break; }
+                }
+
+                if (!zelfde_payload) {
+                    printf("\n*** TWEE VERSCHILLENDE SYNC-PAKKETTEN, ZELFDE SEED 0x%04lX ***\n",
+                           (unsigned long)gevonden);
+                    printf("    Dit is je echte OtaCrcInitializer.\n");
+                    printf("    UID5            = %lu\n", (unsigned long)lo);
+                    printf("    UID4 ^ VERSION  = 0x%02X (lage 6 bits)\n", hi);
+                    printf("    Nu ingesteld    : 0x%04X\n\n", (unsigned)ELRS_CRC_INIT);
+                }
+            }
+
+            if (!gevonden_in_tabel && sync_n < 16) {
+                sync_seed[sync_n] = (uint16_t)gevonden;
+                for (uint8_t k = 0; k < ELRS_CRC_CALC_LEN; k++) {
+                    sync_pl[sync_n][k] = calc_buffer[k];
+                }
+                sync_n++;
+            }
+        }
+    }
+
+    /* --------------------------------------------------------------------
+     *  IQ-vergelijking. Dit is nu de belangrijkste tabel.
+     * --------------------------------------------------------------------
+     *  Kijk naar de kolom max SNR. Een echt LoRa-signaal van -42 dBm dat de
+     *  demodulator vergrendelt geeft +8 tot +10 dB. Blijft de SNR in beide
+     *  standen rond 0, dan haakt hij nergens op aan en ligt het probleem
+     *  niet bij de IQ maar ergens anders in de radiolaag.
+     * -------------------------------------------------------------------- */
+#if ELRS_IQ_SWEEP
+    if ((HAL_GetTick() - iq_rapport_tijd) > (2 * ELRS_IQ_SWEEP_MS)) {
+        iq_rapport_tijd = HAL_GetTick();
+        int32_t fei_ruw = 0;
+        int32_t fei_hz  = SX1280_GetFrequencyError(&fei_ruw);
+
+        printf("\n=== IQ-vergelijking ===\n");
+        printf("  laatste frequentiefout: %ld Hz (ruw %ld)\n", (long)fei_hz, (long)fei_ruw);
+        printf("  stand        | pakketten | max SNR | max RSSI | bin v3 | bin v4\n");
+        printf("  -------------+-----------+---------+----------+--------+-------\n");
+        for (uint8_t k = 0; k < 2; k++) {
+            printf("  %-12s |   %6lu  |  %+4d dB | %5d dBm |  %4u  |  %4u%s\n",
+                   k ? "omgedraaid" : "normaal",
+                   (unsigned long)iq_pakketten[k], iq_max_snr[k], iq_max_rssi[k],
+                   iq_treffer_v3[k], iq_treffer_v4[k],
+                   (iq_max_snr[k] >= 5) ? "   <== ECHTE LOCK" : "");
+        }
+        if (iq_max_snr[0] < 5 && iq_max_snr[1] < 5) {
+            printf("  Beide standen blijven onder +5 dB SNR: de demodulator haakt\n");
+            printf("  nergens op aan. Het probleem zit niet in de IQ-polariteit.\n");
+        }
+        printf("\n");
+    }
+#endif
+
+    /* Elke 400 UNIEKE pakketten: hoe ziet de verdeling eruit? */
+    if ((uniek_tel % 400) == 0) {
+        uint32_t tot = 0;
+        for (int i = 0; i < 64; i++) tot += hist6[i];
+        uint32_t gemiddeld = tot / 64;
+
+        printf("\n--- na %lu unieke pakketten (%lu duplicaten weggegooid) ---\n",
+               (unsigned long)uniek_tel, (unsigned long)dubbel_tel);
+        printf("types: RCDATA %u  DATA %u  SYNC %u  ONGELDIG(0b11) %u\n",
+               type_tel[0], type_tel[1], type_tel[2], type_tel[3]);
+        printf("sterkste RSSI %d dBm, %lu preambles\n",
+               seed_beste_rssi, (unsigned long)elrs_preamble_count);
+        printf("achtergrond: gemiddeld %lu treffers per bin\n\n", (unsigned long)gemiddeld);
+
+        /* Top 5 bins in plaats van alleen de hoogste. Een nepPiek kan een
+         * echte, kleinere piek overschaduwen; zo zie je ze allebei. */
+        printf("  bin | treffers | unieke nonces | oordeel\n");
+        printf("  ----+----------+---------------+---------------------------\n");
+
+        uint8_t gedaan[64] = {0};
+        for (int rang = 0; rang < 5; rang++) {
+            uint8_t top = 255;
+            for (int i = 0; i < 64; i++) {
+                if (!gedaan[i] && (top == 255 || hist6[i] > hist6[top])) top = (uint8_t)i;
+            }
+            if (top == 255) break;
+            gedaan[top] = 1;
+
+            uint16_t divers = 0;
+            for (int b = 0; b < 32; b++) {
+                uint8_t v = nonce_bitmap[top][b];
+                while (v) { divers += (uint16_t)(v & 1u); v >>= 1; }
+            }
+
+            const char *oordeel;
+            if (gemiddeld > 0 && hist6[top] > 3 * gemiddeld && hist6[top] >= 10
+                && divers >= hist6[top] / 2) {
+                oordeel = "ECHTE ZENDER";
+            } else if (gemiddeld > 0 && hist6[top] > 3 * gemiddeld) {
+                oordeel = "herhaalde ruis";
+            } else {
+                oordeel = "achtergrond";
+            }
+            printf("  0x%02X|   %5u  |     %5u     | %s\n",
+                   top, hist6[top], divers, oordeel);
+        }
+
+        /* Je UID staat vast (bevestigd via de Web-UI van de zender). Dan ligt
+         * ook vast in welke bin de echte pakketten MOETEN vallen; alleen de
+         * OTA-versie is nog open. Dus kijken we die twee bins gericht na,
+         * ongeacht of ze in de top 5 staan. */
+        printf("\n  gerichte controle voor UID4=%d:\n", ELRS_UID4);
+        for (uint8_t v = 3; v <= 4; v++) {
+            uint8_t bin = (uint8_t)((ELRS_UID4 ^ v) & 0x3F);
+            uint16_t divers = 0;
+            for (int b = 0; b < 32; b++) {
+                uint8_t x = nonce_bitmap[bin][b];
+                while (x) { divers += (uint16_t)(x & 1u); x >>= 1; }
+            }
+            printf("    OTA_VERSION=%u -> bin 0x%02X: %u treffers, %u unieke nonces  %s\n",
+                   v, bin, hist6[bin], divers,
+                   (gemiddeld > 0 && hist6[bin] > 2 * gemiddeld && divers >= hist6[bin] / 2)
+                       ? "<== DIT IS HET" : "");
+        }
+        printf("\n");
+    }
+
+    SX1280_SetRx();
+    return;
+#endif
+
+#if ELRS_DEBUG_PHY
+    /* ---------------- RUWE DUMP, geen CRC-eis, geen FHSS ---------------- */
+    static uint32_t verworpen      = 0;
+    static uint32_t vorige_match_t = 0;
+    static int16_t  vorige_match_n = -1;
+    static int8_t   beste_rssi     = -128;
+
+    int8_t rssi = 0, snr = 0;
+    SX1280_GetPacketStatus(&rssi, &snr);
+    if (rssi > beste_rssi) beste_rssi = rssi;
+
+    /* Type 0b11 bestaat niet in ELRS, en alles onder de ruisgrens is per
+     * definitie geen zender op tafel. Weggooien, anders verzuipt een echt
+     * pakket in duizend regels rommel. */
+    if (packetType == 0x03 || snr < ELRS_DEBUG_MIN_SNR) {
+        verworpen++;
+        if ((verworpen % 200) == 0) {
+            printf("[%lu pakketten verworpen als ruis, sterkste tot nu toe %d dBm, "
+                   "%lu preambles]\n",
+                   (unsigned long)verworpen, beste_rssi,
+                   (unsigned long)elrs_preamble_count);
+        }
+        SX1280_SetRx();
+        return;
+    }
+
+    printf("#%lu  RSSI %4d dBm  SNR %3d dB  type %d  |  ",
+           (unsigned long)elrs_packet_count, rssi, snr, packetType);
+    for (int i = 0; i < ELRS_PACKET_SIZE; i++) printf("%02X ", payload[i]);
+
+    if (packetType == ELRS_PKT_SYNC) {
+        /* SYNC gebruikt nonceValidator = 0, dus een kale seed en dus maar
+         * een enkele CRC-vergelijking. Kans op toeval: 1 op 16384.
+         * Een SYNC crc=OK is daarmee wel echt bewijs. */
+        uint16_t crc = ELRS_CalculateCRC(calc_buffer, ELRS_CRC_CALC_LEN, ELRS_CRC_INIT);
+        if (crc == ontvangen_crc) {
+            printf(" *** SYNC crc OK  fhss=%3d nonce=%3d  DIT IS DE ZENDER ***",
+                   payload[1], payload[2]);
+        } else {
+            printf(" SYNC crc fout");
+        }
+    } else {
+        /* RC-data: de nonce zit in de seed, dus we lopen alle 256 af.
+         * PAS OP met de interpretatie. 256 pogingen tegen een 14-bit CRC
+         * geeft 256/16384 = 1,55% kans op een toevallige match. Bij ruis
+         * krijg je dus ongeveer 1 valse match per 64 pakketten. Een losse
+         * "crc OK" betekent niets; pas twee matches kort na elkaar met een
+         * oplopende nonce is echt. */
+        int16_t hit = -1;
+        for (uint16_t n = 0; n < 256; n++) {
+            if (ELRS_CalculateCRC(calc_buffer, ELRS_CRC_CALC_LEN,
+                                  (uint16_t)(ELRS_CRC_INIT ^ n)) == ontvangen_crc) {
+                hit = (int16_t)n;
+                break;
+            }
+        }
+        if (hit >= 0) {
+            uint32_t nu = HAL_GetTick();
+            printf(" crc OK bij nonce %d", hit);
+
+            if (vorige_match_n >= 0 && (nu - vorige_match_t) < 1000) {
+                printf("  *** BEVESTIGD: tweede match binnen %lums (vorige nonce %d) ***",
+                       (unsigned long)(nu - vorige_match_t), vorige_match_n);
+            } else {
+                printf("  (los, waarschijnlijk toeval)");
+            }
+            vorige_match_t = nu;
+            vorige_match_n = hit;
+        } else {
+            printf(" crc geen match");
+        }
+    }
+    printf("\n");
+
+    SX1280_SetRx();
+    return;
+#else
+    /* ---------------- NORMALE WERKING ---------------- */
+    if (elrs_link_state == ELRS_STATE_SEARCHING)
+    {
+        /* ------------------------------------------------------------------
+         *  Levensteken tijdens het zoeken
+         * ------------------------------------------------------------------
+         *  Zonder dit zit je naar een leeg scherm te kijken zonder te weten
+         *  of er iets binnenkomt. Een geldig SYNC-pakket is zeldzaam: de
+         *  zender komt maar 3 keer per 9,6 s op het sync-kanaal langs.
+         * ------------------------------------------------------------------ */
+        static uint32_t zk_totaal = 0, zk_geldig = 0, zk_sync = 0, zk_sterk = 0;
+        static uint32_t zk_print = 0;
+
+        zk_totaal++;
+        uint16_t gebruikte_seed = 0;
+        uint8_t  is_geldig = ELRS_ValidatePacket(calc_buffer, ontvangen_crc, &gebruikte_seed);
+
+        /* Sterkte bepaalt of dit pakket ECHT van kanaal 40 komt of van een
+         * buurkanaal dat er doorheen lekt. Alleen op de eerste soort mogen
+         * we locken, want alleen dan staat de zender op index 0/80/160. */
+        int8_t acq_rssi = 0, acq_snr = -128;
+        if (is_geldig) SX1280_GetPacketStatus(&acq_rssi, &acq_snr);
+        if (is_geldig && acq_snr >= ELRS_ACQ_MIN_SNR) zk_sterk++;
+
+        if (is_geldig) {
+            zk_geldig++;
+            if (packetType == ELRS_PKT_SYNC) zk_sync++;
+
+            /* Elk geldig RC-pakket levert al kanaalwaarden op, ook zonder
+             * lock. Handig bewijs dat de link leeft terwijl je wacht. */
+            /* Alleen de sterke pakketten printen; de zwakke buurkanaal-
+             * pakketten voegen niets toe en vervuilen het beeld. */
+            if (packetType == ELRS_PKT_RCDATA && acq_snr >= ELRS_ACQ_MIN_SNR) {
+                static uint32_t zoek_print = 0;
+                if ((++zoek_print % ELRS_PRINT_ELKE) == 0) {
+                    uint16_t ch[4];
+                    ELRS_UnpackChannels(payload, ch);
+                    printf("op kanaal 40  CH %4u %4u %4u %4u   RSSI %4d dBm  "
+                           "SNR %+3d  seed 0x%04X\n",
+                           ch[0], ch[1], ch[2], ch[3], acq_rssi, acq_snr,
+                           gebruikte_seed);
+                }
+            }
+        }
+
+        if ((HAL_GetTick() - zk_print) > 3000) {
+            zk_print = HAL_GetTick();
+            printf("zoeken... %lu pakketten, %lu geldig, waarvan %lu sterk, "
+                   "%lu geldige SYNC\n",
+                   (unsigned long)zk_totaal, (unsigned long)zk_geldig,
+                   (unsigned long)zk_sterk, (unsigned long)zk_sync);
+        }
+
+        /* Een SYNC-pakket bevat fhssIndex en nonce, precies wat we nodig
+         * hebben om mee te gaan hoppen.
+         *
+         * Omdat we 64 seeds proberen is de kans op een toevallige CRC-match
+         * 0,39%. Daarom hier een tweede slot op de deur: de sync-payload
+         * draagt UID4 en UID5 zelf mee op byte 5 en 6, en de fhssIndex moet
+         * binnen de tabel vallen. Samen zakt de kans op vals alarm naar
+         * ongeveer 1 op 16 miljoen. */
+        uint8_t sync_ok = is_geldig && (packetType == ELRS_PKT_SYNC);
+#if ELRS_SYNC_UID_CHECK
+        if (sync_ok) {
+            sync_ok = (payload[5] == ELRS_UID4)
+                   && (payload[6] == ELRS_UID5)
+                   && ELRS_FHSSIDX_OK(payload[1]);
+            if (!sync_ok) {
+                printf("SYNC met geldige CRC maar verkeerde UID: "
+                       "payload[5]=%u payload[6]=%u (verwacht %u en %u)\n",
+                       payload[5], payload[6], ELRS_UID4, ELRS_UID5);
+            }
+        }
+#endif
+        if (sync_ok)
+        {
+            fhss_index      = (uint8_t)(payload[1] % ELRS_SEQUENCE_COUNT);
+            elrs_nonce      = payload[2];
+            elrs_link_state = ELRS_STATE_LOCKED;
+            is_synchronized = 1;
+            elrs_acq_bevestigd = 1;      /* uit een sync: index is zeker */
+            last_packet_time = HAL_GetTick();
+
+            /* Ankerpunt: vanaf hier volgt de index uit de nonce. */
+            elrs_anker_nonce = elrs_nonce;
+            elrs_anker_index = fhss_index;
+            elrs_anker_ticks = elrs_ticks;
+            elrs_anker_van_sync = 1;      /* index bewezen, niet gegokt */
+
+            printf("\n>>> SYNC! fhss_index=%d nonce=%d <<<\n\n", fhss_index, elrs_nonce);
+
+            ELRS_PhaseReset();
+            __HAL_TIM_SET_COUNTER(&htim3, 0);
+            HAL_TIM_Base_Start_IT(&htim3);
+        }
+#if ELRS_ACQ_VIA_RCDATA
+        /* ------------------------------------------------------------------
+         *  Acquisitie zonder sync-pakket
+         * ------------------------------------------------------------------
+         *  We staan op het sync-kanaal, dus een geldig RC-pakket betekent dat
+         *  de zender op een index staat waar kanaal 40 staat: 0, 80, 160 of
+         *  240. Vier kandidaten, die we een voor een proberen.
+         *
+         *  De nonce halen we uit de hoge bits van de seed. Dat geeft alleen
+         *  nonce mod 64, maar voor de hop-timing is de pariteit genoeg.
+         * ------------------------------------------------------------------ */
+        else if (is_geldig && packetType == ELRS_PKT_RCDATA
+                 && acq_snr >= ELRS_ACQ_MIN_SNR)
+        {
+            /* Het sync-kanaal staat op elke index waar i % 80 == 0. Bij een
+             * sequence van 240 zijn dat er drie (0, 80, 160), niet vier.
+             * Dat ging eerder mis: kandidaat 240 bestaat dan niet, de lock
+             * werd overgeslagen en de teller bleef staan -- waardoor er na
+             * drie mislukte pogingen niets meer gebeurde. */
+            uint8_t k = (uint8_t)(elrs_acq_poging % ELRS_ACQ_KANDIDATEN);
+
+            fhss_index = (uint8_t)(k * ELRS_FREQ_COUNT);
+            elrs_nonce = ELRS_NONCE_UIT_SEED(gebruikte_seed);
+
+            elrs_link_state    = ELRS_STATE_LOCKED;
+            is_synchronized    = 1;
+            elrs_acq_bevestigd = 0;      /* nog te bewijzen */
+            elrs_acq_teller    = 0;
+            last_packet_time   = HAL_GetTick();
+
+            elrs_anker_nonce = elrs_nonce;
+            elrs_anker_index = fhss_index;
+            elrs_anker_ticks = elrs_ticks;
+            elrs_anker_van_sync = 0;      /* dit is een gok, geen bewijs */
+
+            printf("\n>>> poging %u van %u: fhss_index=%u, nonce=%u <<<\n",
+                   (unsigned)(k + 1), (unsigned)ELRS_ACQ_KANDIDATEN,
+                   fhss_index, elrs_nonce);
+
+            ELRS_PhaseReset();
+            __HAL_TIM_SET_COUNTER(&htim3, 0);
+            HAL_TIM_Base_Start_IT(&htim3);
+        }
+#endif
+    }
+    else /* ELRS_STATE_LOCKED */
+    {
+        /* We weten welke nonce we verwachten. Een klein venster opvangt de
+         * gevallen waar we een tick mislopen. */
+        int16_t  geldige_nonce = -1;
+        uint16_t gebruikte_seed = 0;
+
+        /* Wat onze timer voorspelde, vastgelegd VOOR de validatie hem
+         * gelijktrekt met de zender. Anders is het verschil altijd nul en
+         * meet je niets. */
+        uint8_t voorspelde_nonce = elrs_nonce;
+
+        /* Met de nonce in de seed en de tabelcheck uit wordt gebruikte_seed
+         * nergens gelezen; dat mag de compiler weten. */
+        (void)gebruikte_seed;
+
+#if ELRS_NONCE_IN_CRC
+        if (packetType == ELRS_PKT_SYNC) {
+            if (ELRS_ValidatePacket(calc_buffer, ontvangen_crc, NULL)) {
+                geldige_nonce = elrs_nonce;
+                fhss_index = (uint8_t)(payload[1] % ELRS_SEQUENCE_COUNT);
+                elrs_nonce = payload[2];
+
+                /* Het anker stond hier NIET bijgewerkt. Gevolg: had de link
+                 * zich via een gegokt RC-pakket vergrendeld, dan bleef die gok
+                 * voor altijd staan, ook als de zender daarna netjes vertelde
+                 * waar hij echt zat. Een sync is de enige harde bron voor de
+                 * absolute index, dus die nemen we altijd over. */
+                elrs_anker_nonce    = elrs_nonce;
+                elrs_anker_index    = fhss_index;
+                elrs_anker_ticks    = elrs_ticks;
+                elrs_anker_van_sync = 1;
+                elrs_acq_bevestigd  = 1;
+            }
+        } else {
+            /* Nonce zit in de seed: klein venster rond de verwachte waarde. */
+            for (int8_t d = -2; d <= 2; d++) {
+                uint8_t test_nonce = (uint8_t)(elrs_nonce + d);
+                uint16_t seed = ELRS_SEED_VOOR(packetType, test_nonce);
+                if (ELRS_CalculateCRC(calc_buffer, ELRS_CRC_CALC_LEN, seed) == ontvangen_crc) {
+                    geldige_nonce  = test_nonce;
+                    elrs_nonce     = test_nonce;
+                    gebruikte_seed = seed;   /* stond hier niet; zonder dit bleef
+                                              * gebruikte_seed op 0 staan en gaf
+                                              * de nonce-terugrekening altijd 162 */
+                    break;
+                }
+            }
+        }
+#else
+        /* We proberen alle 64 seeds. De gebruikte seed verklapt daarna welke
+         * nonce de zender had, en dat gebruiken we voor de timingcontrole. */
+        if (ELRS_ValidatePacket(calc_buffer, ontvangen_crc, &gebruikte_seed)) {
+            geldige_nonce = elrs_nonce;
+
+            if (packetType == ELRS_PKT_SYNC) {
+                /* Een sync-pakket is de betrouwbaarste bron: index en nonce
+                 * komen rechtstreeks van de zender. Anker opnieuw zetten. */
+                fhss_index = (uint8_t)(payload[1] % ELRS_SEQUENCE_COUNT);
+                elrs_nonce = payload[2];
+                elrs_anker_nonce = elrs_nonce;
+                elrs_anker_index = fhss_index;
+                elrs_anker_ticks = elrs_ticks;
+            }
+        }
+#endif
+
+        if (geldige_nonce >= 0) {
+            last_packet_time = HAL_GetTick();
+
+            /* Genoeg geldige pakketten na het hoppen? Dan klopt de gekozen
+             * kandidaat-index en mag de ruime timeout aan. */
+            if (!elrs_acq_bevestigd) {
+                if (++elrs_acq_teller >= ELRS_ACQ_BEVESTIG) {
+                    elrs_acq_bevestigd = 1;
+                    printf("\n>>> LINK BEVESTIGD op startindex %u <<<\n\n",
+                           (unsigned)((elrs_acq_poging % ELRS_ACQ_KANDIDATEN)
+                                      * ELRS_FREQ_COUNT));
+                }
+            }
+
+            /* Houd de timer in de pas met de zender. */
+            ELRS_PhaseLock();
+
+#if ELRS_DEBUG_UIDZOEK
+            ELRS_UidZoekPakket();
+#endif
+
+            if (packetType == ELRS_PKT_RCDATA) {
+                uint16_t ch[4];
+                ELRS_UnpackChannels(payload, ch);
+                for (int i = 0; i < 4; i++) elrs_channels[i] = ch[i];
+                elrs_failsafe = 0;          /* verse stuurgegevens */
+
+                /* ----------------------------------------------------------
+                 *  TIMINGCONTROLE
+                 * ----------------------------------------------------------
+                 *  Bij RC-data zit de nonce in de hoge bits van de seed. Die
+                 *  kunnen we er dus uit terugrekenen en vergelijken met onze
+                 *  eigen teller. Loopt dat verschil constant, dan tikt onze
+                 *  timer gelijk met de zender en is alleen de FHSS-tabel nog
+                 *  in twijfel. Loopt het weg, dan zit de fout in de timing.
+                 * ---------------------------------------------------------- */
+                /* geldige_nonce IS de nonce van de zender: die kwam uit het
+                 * zoekvenster dat zojuist de CRC liet kloppen. Rechtstreeks
+                 * gebruiken is exacter dan hem uit de seed terugrekenen. */
+                uint8_t nonce_gemeten = (uint8_t)geldige_nonce;
+
+#if ELRS_DEBUG_TABELCHECK
+                /* ----------------------------------------------------------
+                 *  Tabelcontrole zonder van kanaal te wisselen
+                 * ----------------------------------------------------------
+                 *  We staan vast op kanaal 40. Reken uit op welke index de
+                 *  zender stond toen hij dit pakket verstuurde. Klopt onze
+                 *  tabel, dan moet daar kanaal 40 staan -- en dat is alleen
+                 *  zo bij index 0, 80 en 160.
+                 * ---------------------------------------------------------- */
+                {
+                    static uint16_t tc_totaal = 0, tc_goed = 0;
+
+                    uint32_t d   = elrs_ticks - elrs_anker_ticks;
+                    uint16_t idx = (uint16_t)(((uint32_t)elrs_anker_index
+                                    + d / ELRS_FHSS_HOP_INTERVAL) % ELRS_SEQUENCE_COUNT);
+                    uint8_t  kan = fhss_sequence[idx];
+
+                    tc_totaal++;
+                    if (kan == ELRS_PARK_CHANNEL) tc_goed++;
+
+                    printf("tabelcheck: seed 0x%04X -> nonce %3u -> index %3u -> "
+                           "tabel zegt kanaal %2u, wij staan op %2u  %s   "
+                           "(%u van %u goed)\n",
+                           gebruikte_seed, nonce_gemeten, idx, kan,
+                           ELRS_PARK_CHANNEL,
+                           (kan == ELRS_PARK_CHANNEL) ? "KLOPT" : "fout",
+                           tc_goed, tc_totaal);
+
+                    if (tc_totaal == 20) {
+                        printf("\n>>> %u van de 20 kloppen. Bij toeval verwacht je er "
+                               "0 of 1 (3 van de 240 posities).\n", tc_goed);
+                        printf(">>> %s\n\n", (tc_goed >= 15)
+                               ? "Tabel en timing zijn goed. Zet ELRS_HOP_ENABLE op 1."
+                               : "Tabel of timing klopt niet.");
+                    }
+                }
+#endif
+
+                int16_t afwijking = (int16_t)((uint8_t)(nonce_gemeten - voorspelde_nonce));
+                if (afwijking > 127) afwijking -= 256;
+
+                if ((++print_teller % ELRS_PRINT_ELKE) == 0) {
+                    printf("CH %4d %4d %4d %4d | onze voorspelling %3u, zender %3u, "
+                           "verschil %+d | fhss_idx %u\n",
+                           ch[0], ch[1], ch[2], ch[3],
+                           voorspelde_nonce, nonce_gemeten, afwijking, fhss_index);
+                }
+            }
+        }
+    }
+
+    /* ----------------------------------------------------------------------
+     *  Bewust GEEN SetRx() meer na elk pakket
+     * ----------------------------------------------------------------------
+     *  We draaien in Rx Continuous (periodBaseCount 0xFFFF). Datasheet p.135:
+     *  "the device remains in Rx mode until the host sends a command to change
+     *  the operation mode. The device can receive several packets."
+     *
+     *  Opnieuw SetRx sturen HERSTART dus de ontvanger zonder dat het nodig is.
+     *  Bij 250 Hz is dat schadelijk: een pakket duurt 3,3 ms van de 4 ms, dus
+     *  zodra wij klaar zijn met verwerken komt de preamble van het volgende
+     *  pakket er al aan. Die herstart gooit hem weg.
+     *
+     *  Na een frequentiewissel is SetRx wel nodig, en dat gebeurt in
+     *  ELRS_HandleHop.
+     * ---------------------------------------------------------------------- */
+#endif
+}

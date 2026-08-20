@@ -1,0 +1,994 @@
+/*
+ * sx1280include.h
+ *
+ *  Created on: 1 apr 2026
+ *      Author: tijme
+ */
+#include "stdint.h"
+#include "main.h"
+
+#ifndef INC_SX1280INCLUDE_H_
+#define INC_SX1280INCLUDE_H_
+
+/* ==========================================================================
+ *  SX1280 commando-opcodes
+ * ========================================================================== */
+#define SX1280_GETSTATUS                        0xC0
+#define SX1280_WRITEREGISTER                    0x18
+#define SX1280_READREGISTER                     0x19
+#define SX1280_WRITEBUFFER                      0x1A
+#define SX1280_READBUFFER                       0x1B
+#define SX1280_SETSLEEP                         0x84
+#define SX1280_SET_STANDBY                      0x80
+#define SX1280_SETFS                            0xC1
+#define SX1280_SETTX                            0x83
+#define SX1280_SETRX                            0x82
+#define SX1280_SETRXDUTYCYCLE                   0x94
+#define SX1280_SETCAD                           0xC5
+#define SX1280_SETTXCONTINUOUSWAVE              0xD1
+#define SX1280_SETTXCONTINUOUSPREAMBLE          0xD2
+#define SX1280_SETPACKET_TYPE                   0x8A
+#define SX1280_GETPACKET_TYPE                   0x03
+#define SX1280_SETRFFREQUENCY                   0x86
+#define SX1280_SETTXPARAMS                      0x8E
+#define SX1280_SETCADPARAMS                     0x88
+#define SX1280_SETBUFFER_BASEADDRESS            0x8F
+#define SX1280_SETMODULATIONPARAMS              0x8B
+#define SX1280_SET_PACKET_PARAMS                0x8C
+#define SX1280_GETRXBUFFERSTATUS                0x17
+#define SX1280_GETPACKETSTATUS                  0x1D
+#define SX1280_GETRSSIINST                      0x1F
+#define SX1280_GETIRQSTATUS                     0x15
+#define SX1280_CLRIRQSTATUS                     0x97
+#define SX1280_SETREGULATORMODE                 0x96
+#define SX1280_SET_DIO_IRQ_PARAMS               0x8D
+#define SX1280_SET_SAVE_CONTEXT                 0xD5
+#define SX1280_SET_AUTO_FS                      0x9E
+#define SX1280_SET_AUTO_TX                      0x98
+#define SX1280_SET_LONG_PREAMBLE                0x9B
+#define SX1280_SET_UART_SPEED                   0x9D
+#define SX1280_SET_RANGING_ROLE                 0xA3
+#define SX1280_SET_ADVANCED_RANGING             0x9A
+
+/* --- Modulatie / packet parameters (datasheet tabel 14-47 t/m 14-54) --- */
+#define SX1280_PACKET_TYPE_LORA                 0x01
+
+#define SX1280_LORA_SF5                         0x50
+#define SX1280_LORA_SF6                         0x60
+#define SX1280_LORA_SF7                         0x70
+#define SX1280_LORA_SF8                         0x80
+#define SX1280_LORA_SF9                         0x90
+
+#define SX1280_LORA_BW_1600                     0x0A
+#define SX1280_LORA_BW_0800                     0x18
+#define SX1280_LORA_BW_0400                     0x26
+#define SX1280_LORA_BW_0200                     0x34
+
+#define SX1280_LORA_CR_LI_4_5                   0x05
+#define SX1280_LORA_CR_LI_4_6                   0x06
+#define SX1280_LORA_CR_LI_4_8                   0x07
+
+#define SX1280_LORA_PACKET_EXPLICIT             0x00
+#define SX1280_LORA_PACKET_IMPLICIT             0x80
+#define SX1280_LORA_CRC_ON                      0x20
+#define SX1280_LORA_CRC_OFF                     0x00
+
+/* Datasheet p.133: 0x40 = standaard IQ, 0x00 = omgedraaide IQ.
+ * "an IQ inverted packet will be undetectable by a non-inverted Rx" */
+#define SX1280_LORA_IQ_NORMAL                   0x40
+#define SX1280_LORA_IQ_INVERTED                 0x00
+
+/* Datasheet p.131, verplicht direct na SetModulationParams:
+ *     SF5 / SF6    -> 0x1E
+ *     SF7 / SF8    -> 0x37
+ *     SF9 .. SF12  -> 0x32
+ * en in alle gevallen 0x01 naar 0x093C. */
+#define SX1280_REG_SF_ADDITIONAL_CONFIG         0x0925
+#define SX1280_REG_FREQ_ERR_CORRECTION          0x093C
+
+/* IRQ bits */
+#define SX1280_IRQ_TX_DONE                      0x0001
+#define SX1280_IRQ_RX_DONE                      0x0002
+#define SX1280_IRQ_CRC_ERROR                    0x0040
+#define SX1280_IRQ_RX_TX_TIMEOUT                0x4000
+#define SX1280_IRQ_PREAMBLE_DETECTED            0x8000
+
+/* ==========================================================================
+ *  ELRS IDENTITEIT  --  CONTROLEER DEZE TWEE DINGEN EERST
+ * ==========================================================================
+ *
+ * 1) ELRS_OTA_VERSION moet gelijk zijn aan de MAJOR versie van de firmware op
+ *    je RadioMaster T8L. ELRS 3.x -> 3, ELRS 4.x -> 4.
+ *    ELRS XORt dit nummer in zowel de CRC-seed als de FHSS-seed, dus als dit
+ *    niet klopt matcht er letterlijk geen enkel pakket.
+ *
+ * 2) De UID moet exact overeenkomen met wat de binding phrase op je zender
+ *    oplevert. Die 6 bytes lees je af in de ExpressLRS Configurator of in de
+ *    Web-UI van de zender.
+ */
+/* Geverifieerd in de 4.1.0-tag, src/include/targets.h:
+ *     #define OTA_VERSION_ID      4
+ * Draai je terug naar een 3.x-release, zet dit dan op 3. */
+#define ELRS_OTA_VERSION        4
+
+/* ==========================================================================
+ *  BIND-TEST  --  de sterkste test die er is
+ * ==========================================================================
+ *  Druk je op [Binden] in het ELRS Lua-menu, dan schakelt de zender over op
+ *  een UID die publiek bekend is: {0,1,2,3,4,5}. En belangrijker nog: in
+ *  bindmodus HOPT de zender niet meer, hij blijft op een vaste frequentie
+ *  staan en zendt daar continu.
+ *
+ *  Dat verandert de verhoudingen totaal. Normaal komt de zender maar 3 keer
+ *  per 9,6 s op kanaal 40 langs, goed voor 0,6 pakket per seconde. In
+ *  bindmodus zit hij op een kanaal 100% van de tijd, dus 50 pakketten per
+ *  seconde. Bijna honderd keer meer kans, en zonder enige onbekende in de UID.
+ *
+ *  Werkwijze:
+ *    1. Zet ELRS_DEBUG_SCAN op 1, druk op [Binden], draai de scan.
+ *       Zie je nu EEN kanaal fel oplichten en de rest op de ruisvloer, dan
+ *       is bevestigd dat bindmodus niet hopt, en weet je meteen welk kanaal.
+ *    2. Vul dat kanaal in bij ELRS_DEBUG_CHANNEL.
+ *    3. Zet ELRS_BIND_TEST op 1 en draai de seed-analyse.
+ *
+ *  Zie je dan nog steeds niets, dan ligt het probleem met zekerheid in de
+ *  radiolaag en niet in de identiteit. Zie je het wel, dan weten we dat er
+ *  iets misgaat met je eigen UID of de OTA-versie.
+ */
+#define ELRS_BIND_TEST          0
+
+/* Op welk kanaal blijft de ontvanger staan in de debugmodi.
+ * -1 = het sync-kanaal (40). Anders 0..79. */
+#define ELRS_DEBUG_CHANNEL      (-1)
+
+#if ELRS_BIND_TEST
+  #define ELRS_UID0             0
+  #define ELRS_UID1             1
+  #define ELRS_UID2             2
+  #define ELRS_UID3             3
+  #define ELRS_UID4             4
+  #define ELRS_UID5             5
+#else
+  #define ELRS_UID0             163
+  #define ELRS_UID1             59
+  #define ELRS_UID2             219
+  #define ELRS_UID3             118
+  #define ELRS_UID4             199
+  #define ELRS_UID5             162
+#endif
+
+/* CRC-seed. ELRS OTA.cpp -> OtaUpdateCrcInitFromUid():
+ *     OtaCrcInitializer  = (UID[4] << 8) | UID[5];
+ *     OtaCrcInitializer ^= (uint16_t)OTA_VERSION_ID << 8;
+ * Voor UID 199/162 met versie 3: 0xC7A2 ^ 0x0300 = 0xC4A2 */
+/* ==========================================================================
+ *  GEMETEN WAARDEN  --  zwaarder dan de berekende
+ * ==========================================================================
+ *  Jouw firmware is master (d84313) en gedraagt zich op twee punten anders
+ *  dan de huidige ELRS-master waar ik de formules uit heb gehaald. Dit komt
+ *  uit jouw eigen ontvangen pakketten, dus het weegt zwaarder dan mijn
+ *  afleiding uit de broncode.
+ *
+ *  ELRS_CRC_INIT_OVERRIDE
+ *      -1     = uit de UID berekenen (de theorie)
+ *      0x06A1 = de waarde die uit jouw echte pakketten kwam. Zeven van de
+ *               zeven pakketten uit de meerderheidsgroep valideren hiermee.
+ *
+ *  ELRS_NONCE_IN_CRC
+ *      1 = de nonce wordt in de seed geXORd, behalve bij SYNC (huidige master)
+ *      0 = niet. Bij jou bleef de lage byte van de seed constant op 0xA1 over
+ *          alle pakketten heen, dus jouw versie doet dit niet.
+ * ========================================================================== */
+/* Sinds de zender op ELRS 4.1.0 staat gelden de formules uit de broncode weer,
+ * dus geen gemeten waarden meer nodig. De oude waarden ter herinnering:
+ *     0x07A1 met nonce NIET in de seed  (jouw oude master-build d84313)
+ * Nu:  0x03A2 met nonce WEL in de seed  (4.1.0) */
+#define ELRS_CRC_INIT_OVERRIDE  (-1)
+#define ELRS_NONCE_IN_CRC       1
+
+/* De drie seeds die uit jouw eigen pakketten kwamen. SYNC gebruikt de basis,
+ * RC-data wijkt af met 1<<8 of 2<<8. Waarom precies is niet duidelijk, maar
+ * we hoeven het ook niet te weten: we proberen ze alle drie. De kans dat ruis
+ * er toevallig een raakt is 3 op 16384, oftewel 0,018%. */
+#define ELRS_SEED_AANTAL        3
+#define ELRS_SEED_LIJST         { 0x07A1, 0x06A1, 0x05A1 }
+
+/* De seeds blijken om en om te wisselen, dus de hoge 6 bits hangen af van de
+ * nonce. De LAGE byte ligt wel vast op 0xA1 (= UID5 ^ OTA_VERSION). Daarom
+ * proberen we gewoon alle 64 mogelijkheden voor de hoge bits.
+ *
+ *   kosten : 64 x 7 CRC-stappen per pakket, verwaarloosbaar
+ *   risico : 64/16384 = 0,39% kans op een toevallige match
+ *
+ * Voor SYNC-pakketten vangen we dat risico af met ELRS_SYNC_UID_CHECK: het
+ * sync-pakket draagt UID4 en UID5 zelf mee op byte 5 en 6. Samen met de CRC
+ * wordt de kans op vals alarm dan ongeveer 1 op 16 miljoen. */
+#define ELRS_SEED_BRUTE_HI      0
+#define ELRS_SEED_LO            0xA1
+#define ELRS_SYNC_UID_CHECK     1
+
+/* De nonce terugrekenen uit de gebruikte seed. Bij 4.x zit de nonce in de
+ * LAGE byte, dus dat is exact. Bij de oude build zat hij in de hoge bits en
+ * kon je alleen mod 64 aflezen. */
+#if ELRS_NONCE_IN_CRC
+  #define ELRS_NONCE_UIT_SEED(s)  ((uint8_t)(((s) ^ ELRS_CRC_INIT) & 0xFF))
+#else
+  #define ELRS_NONCE_UIT_SEED(s)  ((uint8_t)((ELRS_SEED_BASIS_HI ^ ((s) >> 8)) & 0x3F))
+#endif
+
+#ifndef ELRS_CRC_INIT_OVERRIDE
+  #define ELRS_CRC_INIT_OVERRIDE (-1)
+#endif
+
+#if ELRS_CRC_INIT_OVERRIDE >= 0
+  #define ELRS_CRC_INIT ((uint16_t)ELRS_CRC_INIT_OVERRIDE)
+#else
+  #define ELRS_CRC_INIT ((uint16_t)((((uint16_t)ELRS_UID4 << 8) | (uint16_t)ELRS_UID5) \
+                                     ^ ((uint16_t)ELRS_OTA_VERSION << 8)))
+#endif
+
+/* Seed voor een pakket van dit type met deze nonce. */
+#ifndef ELRS_NONCE_IN_CRC
+  #define ELRS_NONCE_IN_CRC 1
+#endif
+#if ELRS_NONCE_IN_CRC
+  #define ELRS_SEED_VOOR(type, nonce) \
+      ((uint16_t)(ELRS_CRC_INIT ^ (((type) == ELRS_PKT_SYNC) ? 0u : (uint16_t)(nonce))))
+#else
+  #define ELRS_SEED_VOOR(type, nonce)  ((uint16_t)ELRS_CRC_INIT)
+#endif
+
+/* FHSS-seed. ELRS OTA.cpp -> OtaGetUidSeed():
+ *     (UID[2]<<24) + (UID[3]<<16) + (UID[4]<<8) + (UID[5] ^ OTA_VERSION_ID) */
+#define ELRS_FHSS_SEED  ((uint32_t)(((uint32_t)ELRS_UID2 << 24) | ((uint32_t)ELRS_UID3 << 16) \
+                                   | ((uint32_t)ELRS_UID4 << 8)  | (uint32_t)(ELRS_UID5 ^ ELRS_OTA_VERSION)))
+
+/* ELRS kiest de IQ-polariteit met (UID[5] & 0x01). UID5 = 162 is even, dus
+ * normaal. Dat is afgeleid uit de ELRS-driver en niet uit eigen meting, dus
+ * als er verder niets meer te vinden is: zet ELRS_IQ_OVERRIDE op 0x00 en
+ * probeer het omgekeerde. Een omgedraaide IQ maakt de zender onzichtbaar,
+ * en dat is precies wat we zien.
+ *   -1   = automatisch uit UID[5]
+ *   0x40 = forceer normaal
+ *   0x00 = forceer omgedraaid */
+#define ELRS_IQ_OVERRIDE       (-1)
+
+/* ELRS_IQ_SWEEP = 1 : wissel automatisch heen en weer tussen normale en
+ * omgedraaide IQ en houd per stand aparte statistiek bij. Dan hoef je niet
+ * twee keer te flashen en meet je beide standen onder dezelfde omstandigheden.
+ *
+ * De beslissende maat is de MAXIMALE SNR, niet het aantal pakketten. Haakt de
+ * demodulator echt aan op een LoRa-signaal van -42 dBm, dan rapporteert de
+ * chip een SNR van +8 tot +10 dB. Blijft de SNR rond 0 hangen, dan zijn het
+ * allemaal valse locks op ruis. Daar heb je geen statistiek voor nodig: een
+ * enkele meting van +8 dB is al bewijs. */
+#define ELRS_IQ_SWEEP          0
+#define ELRS_IQ_SWEEP_MS       20000
+
+/* Vangnet: een macro die niet bestaat telt in #if als 0, en dan kiest de
+ * preprocessor de tak die hem wel gebruikt. Dat geeft een onbegrijpelijke
+ * foutmelding ergens anders in het bestand. Deze twee regels voorkomen dat. */
+#ifndef ELRS_IQ_OVERRIDE
+  #define ELRS_IQ_OVERRIDE     (-1)
+#endif
+
+#if ELRS_IQ_OVERRIDE >= 0
+  #define ELRS_IQ_MODE ((uint8_t)ELRS_IQ_OVERRIDE)
+#else
+  #define ELRS_IQ_MODE ((ELRS_UID5 & 0x01) ? SX1280_LORA_IQ_INVERTED : SX1280_LORA_IQ_NORMAL)
+#endif
+
+/* LoRa syncword-registers. ELRS raakt deze niet aan, dus beide kanten horen
+ * op de fabriekswaarde te staan. Als hier iets anders staat dan verwacht,
+ * dan zie je elkaar sowieso niet. */
+#define SX1280_REG_LORA_SYNCWORD_MSB            0x0944
+#define SX1280_REG_LORA_SYNCWORD_LSB            0x0945
+
+/* ==========================================================================
+ *  PACKET RATE  --  MOET EXACT MATCHEN MET DE T8L
+ * ==========================================================================
+ *  De spreading factor volgt uit de packet rate. Staat je zender op 250 Hz
+ *  en je ontvanger op SF8 (50 Hz), dan detecteert de chip de preamble niet
+ *  eens: je hoort dan letterlijk niets, ook niet van 30 cm afstand.
+ *
+ *  Weet je niet welke rate er op de T8L staat: probeer ze een voor een.
+ *  250 Hz is de meest voorkomende fabrieksinstelling.
+ *
+ *  Waarden komen uit ELRS common.cpp, ExpressLRS_AirRateConfig[] voor SX128X.
+ *  Alleen de rates met een 8-byte pakket staan hier; 333 Hz en 100 Hz gebruiken
+ *  een 13-byte pakket met CRC16 en passen niet in deze code.
+ */
+#define ELRS_RATE_500HZ         0
+#define ELRS_RATE_250HZ         1
+#define ELRS_RATE_150HZ         2
+#define ELRS_RATE_50HZ          3
+
+/* GEMETEN met de ratescan: 250Hz gaf 35 tot 56 pakketten per 8 seconden,
+ * 50Hz gaf er nul. De firmware-update heeft de pakketsnelheid op de zender
+ * teruggezet naar de standaard. */
+#define ELRS_RATE               ELRS_RATE_250HZ
+
+#if   ELRS_RATE == ELRS_RATE_500HZ
+  #define ELRS_SF                 SX1280_LORA_SF5
+  #define ELRS_CR                 SX1280_LORA_CR_LI_4_6
+  #define ELRS_PREAMBLE_LEN       12
+  #define ELRS_FHSS_HOP_INTERVAL  4
+  #define ELRS_PACKET_INTERVAL_US 2000
+  #define ELRS_SF_CONFIG_REG      0x1E      /* SF5 */
+  #define ELRS_RATE_NAAM          "500Hz SF5"
+#elif ELRS_RATE == ELRS_RATE_250HZ
+  #define ELRS_SF                 SX1280_LORA_SF6
+  #define ELRS_CR                 SX1280_LORA_CR_LI_4_8
+  #define ELRS_PREAMBLE_LEN       14
+  #define ELRS_FHSS_HOP_INTERVAL  4
+  #define ELRS_PACKET_INTERVAL_US 4000
+  #define ELRS_SF_CONFIG_REG      0x1E      /* SF6 */
+  #define ELRS_RATE_NAAM          "250Hz SF6"
+#elif ELRS_RATE == ELRS_RATE_150HZ
+  #define ELRS_SF                 SX1280_LORA_SF7
+  #define ELRS_CR                 SX1280_LORA_CR_LI_4_8
+  #define ELRS_PREAMBLE_LEN       12
+  #define ELRS_FHSS_HOP_INTERVAL  4
+  #define ELRS_PACKET_INTERVAL_US 6666
+  #define ELRS_SF_CONFIG_REG      0x37      /* SF7 */
+  #define ELRS_RATE_NAAM          "150Hz SF7"
+#else
+  #define ELRS_SF                 SX1280_LORA_SF8
+  #define ELRS_CR                 SX1280_LORA_CR_LI_4_8
+  #define ELRS_PREAMBLE_LEN       12
+  #define ELRS_FHSS_HOP_INTERVAL  2
+  #define ELRS_PACKET_INTERVAL_US 20000
+  #define ELRS_SF_CONFIG_REG      0x37      /* SF8 */
+  #define ELRS_RATE_NAAM          "50Hz SF8"
+#endif
+
+#define ELRS_BW                 SX1280_LORA_BW_0800   /* alle 2.4G LoRa rates */
+
+/* Bij 250 Hz komen er vijf keer zoveel pakketten binnen als bij 50 Hz. Een
+ * printf-regel kost bij 115200 baud al gauw 3 ms, dus daar moet je niet elk
+ * pakket meer uitschrijven.
+ *
+ * En dat printen is nu ECHT de moeite waard om te temperen. Een regel van 95
+ * tekens duurt op 115200 baud 8,3 ms, en al die tijd staat de main-loop stil
+ * en luistert er niemand naar de radio. Bij vijf regels per seconde is dat
+ * 4% van de tijd -- precies de orde van de paar procent die je nu nog mist.
+ * Op een regel per seconde blijft daar 0,8% van over. */
+#define ELRS_PRINT_ELKE         (1000000 / ELRS_PACKET_INTERVAL_US / 1)
+
+/* ==========================================================================
+ *  FAILSAFE
+ * ==========================================================================
+ *  Zonder dit blijven de kanaalwaarden staan op wat er het laatst binnenkwam.
+ *  Valt de verbinding weg terwijl je vliegt, dan houdt de drone dus gewoon
+ *  zijn laatste gas vast en vliegt hij door tot de accu leeg is. Dat is het
+ *  enige stuk dat nog echt gevaarlijk was.
+ *
+ *  Welk kanaal je gas is hangt af van de volgorde in je zender. Standaard is
+ *  AETR, dus kanaal 0 = rol, 1 = pitch, 2 = gas, 3 = gier. Controleer dat een
+ *  keer door alleen je gasstick te bewegen en te kijken welk getal meeloopt. */
+#define ELRS_FAILSAFE_GAS_KANAAL 2
+#define ELRS_FAILSAFE_GAS_WAARDE 0      /* 10 bits, dus 0 = helemaal dicht */
+#define ELRS_FAILSAFE_MIDDEN     512    /* de andere assen netjes neutraal  */
+
+/* ==========================================================================
+ *  ELRS 2.4 GHz band / FHSS   (ELRS FHSS.cpp, domein "ISM2G4")
+ * ========================================================================== */
+#define ELRS_FREQ_START         2400400000UL    /* frequentie van kanaal 0 */
+#define ELRS_FREQ_STEP_HZ       1000000UL       /* 79 MHz over 79 stappen  */
+#define ELRS_FREQ_COUNT         80              /* aantal kanalen          */
+#define ELRS_SYNC_CHANNEL       (ELRS_FREQ_COUNT / 2)   /* = 40 */
+#define ELRS_SYNC_FREQ          (ELRS_FREQ_START + (uint32_t)ELRS_SYNC_CHANNEL * ELRS_FREQ_STEP_HZ)
+
+/* Kanaal waar de debugmodi op blijven staan (zie ELRS_DEBUG_CHANNEL boven). */
+#if ELRS_DEBUG_CHANNEL >= 0
+  #define ELRS_PARK_CHANNEL     ELRS_DEBUG_CHANNEL
+#else
+  #define ELRS_PARK_CHANNEL     ELRS_SYNC_CHANNEL
+#endif
+#define ELRS_PARK_FREQ          (ELRS_FREQ_START + (uint32_t)ELRS_PARK_CHANNEL * ELRS_FREQ_STEP_HZ)
+
+/* LET OP: ELRS gebruikt GEEN 256 entries in de hop-tabel maar:
+ *     primaryBandCount = (FHSS_SEQUENCE_LEN / freq_count) * freq_count
+ *                      = (256 / 80) * 80 = 240
+ * De index wrapt dus op 240. Niet op 80 en niet op 256. */
+/* De huidige ELRS-master rekent primaryBandCount = (256/80)*80 = 240 uit.
+ * Die berekening is er later bij gekomen voor dual band; oudere versies
+ * gebruikten gewoon alle 256 entries. Jouw nonce-fase op kanaal 40 wijst op
+ * 256. Probeer beide als het hoppen niet stabiel wordt. */
+/* GEMETEN, niet aangenomen: de burst-timing op kanaal 40 herhaalt zich met
+ * een periode van exact 9600 ms, met een spreiding van 1 ms over 44 seconden.
+ *     240 hops x 2 pakketten x 20 ms = 9600 ms   <- dit is het
+ *     256 hops x 2 pakketten x 20 ms = 10240 ms
+ * Dus 240, en hop-interval 2. Beide bevestigd. */
+#define ELRS_SEQUENCE_COUNT     240
+
+/* De tabel zelf is ruimer dan de sequence: de shuffle-lus uit ELRS schrijft
+ * bij i >= 240 tot index 319. In ELRS zelf is dat een buffer overflow; wij
+ * geven er gewoon plaats voor zodat er niets naast wordt geschreven. */
+#define ELRS_SEQUENCE_BUFFER    320
+
+/* Bij een sequence van 256 kan een uint8_t nooit buiten bereik vallen, dus
+ * dan is de controle zinloos. De compiler waarschuwt daar terecht voor. */
+#if ELRS_SEQUENCE_COUNT < 256
+  #define ELRS_FHSSIDX_OK(x)    ((x) < ELRS_SEQUENCE_COUNT)
+#else
+  #define ELRS_FHSSIDX_OK(x)    (1)
+#endif
+
+/* Hoge bits van de basis-seed (SYNC gebruikt deze kaal). Uit jouw pakketten
+ * gemeten: 0x07A1, dus 0x07. Bij RC-data zit de nonce in de hoge bits, dus
+ * daar kan je hem uit terugrekenen. Dat gebruiken we om te controleren of
+ * onze nonce-teller gelijk loopt met de zender. */
+#define ELRS_SEED_BASIS_HI      0x07
+
+/* 0 = na een sync-lock op het sync-kanaal blijven staan in plaats van hoppen.
+ *     Zo controleer je of de TIMING klopt, los van de FHSS-tabel.
+ * 1 = normaal meehoppen. */
+#define ELRS_HOP_ENABLE         1
+
+/* ELRS_DEBUG_TABELCHECK = 1 : controleer de FHSS-tabel zonder ook maar een
+ *   keer van kanaal te wisselen.
+ *
+ *   Na een sync-lock ken je anker_index en anker_nonce van de zender, en de
+ *   nonce loopt mee in je timer. Voor elk ontvangen pakket kan je dus
+ *   uitrekenen op welke index de zender stond:
+ *
+ *       index = anker_index + (nonce - anker_nonce) / hop_interval
+ *
+ *   Jij staat vast op kanaal 40. Klopt je tabel, dan MOET fhss_sequence[index]
+ *   gelijk zijn aan 40 -- en 40 staat maar op drie plekken: 0, 80 en 160.
+ *
+ *     tabel en timing goed : bijna elk pakket geeft index 0, 80 of 160
+ *     tabel of timing fout : de indexen liggen willekeurig verspreid
+ *
+ *   Kans op toeval is 3 op 240, dus 1,2%. Twintig pakketten volstaan.
+ *   Gebruik dit met ELRS_HOP_ENABLE op 0. */
+#define ELRS_DEBUG_TABELCHECK   0
+
+/* ==========================================================================
+ *  ACQUISITIE ZONDER SYNC-PAKKET
+ * ==========================================================================
+ *  Geldige SYNC-pakketten zijn bij jouw firmware te zeldzaam om op te wachten.
+ *  Maar we hebben ze ook niet nodig.
+ *
+ *  Je staat op het sync-kanaal. Komt daar een geldig RC-pakket binnen, dan
+ *  staat de zender op een sequence-index waar kanaal 40 staat, en dat is
+ *  alleen bij i % 80 == 0. Dat zijn maar vier mogelijkheden: 0, 80, 160, 240.
+ *
+ *  De nonce lees je uit de hoge bits van de seed. Voor de hop-timing heb je
+ *  alleen de pariteit nodig, want het hop-interval is 2.
+ *
+ *  Dus proberen we de vier kandidaten gewoon een voor een. Blijft de link
+ *  staan, dan was het de goede. Zo niet, de volgende. Binnen enkele seconden
+ *  weet je het, in plaats van minuten wachten.
+ */
+/* ELRS_DEBUG_NEXTCH = 1 : meet welk kanaal de zender NA het sync-kanaal
+ *   gebruikt, in plaats van het uit onze tabel te geloven.
+ *
+ *   Werkwijze: wacht op het sync-kanaal op een geldig RC-pakket. Op dat
+ *   moment staat de zender op een index waar kanaal 40 staat. Spring dan
+ *   meteen naar een testkanaal en luister 45 ms. Komt daar iets, dan is dat
+ *   het echte volgende kanaal.
+ *
+ *   Dit zegt direct of onze FHSS-tabel klopt, zonder aannames over de seed
+ *   of het algoritme. Duurt ongeveer twee minuten.
+ */
+#define ELRS_DEBUG_NEXTCH       0
+#define ELRS_NEXTCH_RONDES      3
+
+/* ELRS_DEBUG_BURST = 1 : blijf op het sync-kanaal staan en noteer wanneer er
+ *   geldige pakketten binnenkomen. Print daarna de tijd tussen opeenvolgende
+ *   pakketten.
+ *
+ *   Hier vallen twee onbekenden meteen uit, zonder enige aanname over de
+ *   seed, het algoritme of de sequence-lengte:
+ *
+ *   1) Aantal pakketten per bezoek = het HOP-INTERVAL.
+ *        2 pakketten, 20 ms uit elkaar  -> interval 2
+ *        4 pakketten                    -> interval 4
+ *
+ *   2) Tijd TUSSEN twee bezoeken = 80 hops lang.
+ *        3,2 s  -> hop-interval 2   (80 x 2 x 20 ms)
+ *        6,4 s  -> hop-interval 4
+ *
+ *   Gewoon een klok en een kanaal. Dit kan niet misgaan.
+ */
+#define ELRS_DEBUG_BURST        0
+#define ELRS_BURST_AANTAL       60
+
+/* ELRS_DEBUG_RATESCAN = 1 : loop alle LoRa-pakketsnelheden van ELRS af en tel
+ *   per stand hoeveel preambles en pakketten er binnenkomen.
+ *
+ *   Hiermee hoef je niet te vertrouwen op wat de Web-UI beweert; de ontvanger
+ *   zoekt zelf uit op welke modulatie je zender staat. De waarden komen uit
+ *   ExpressLRS_AirRateConfig[] voor SX128X, geverifieerd in tag 4.1.0.
+ *
+ *   Blijft op het sync-kanaal staan, ongeveer 8 seconden per stand. */
+#define ELRS_DEBUG_RATESCAN     0
+#define ELRS_RATESCAN_MS        8000
+#define ELRS_NEXTCH_LUISTER_MS  45
+
+#define ELRS_ACQ_VIA_RCDATA     1
+/* Deze twee moeten bij elkaar passen. Bij ~10 pakketten per seconde haal je
+ * in 1200 ms maar 12 pakketten, dus een drempel van 25 kon zelfs de JUISTE
+ * kandidaat niet halen. In het log stond dan "poging 2 mislukt (19 geldige
+ * pakketten)" -- afgekeurd terwijl hij goed was.
+ *
+ * Nu het hoppen werkt is dat andersom: een JUISTE kandidaat levert meteen
+ * ~180 pakketten per seconde, een verkeerde hooguit een handvol. Het verschil
+ * is zo groot dat je er niet lang op hoeft te wachten:
+ *     juiste kandidaat    -> 20 pakketten in ongeveer 110 ms
+ *     verkeerde kandidaat -> een stuk of twee in 600 ms, dus afgekeurd
+ * Daarmee is de slechtste startsituatie drie kandidaten x 600 ms, oftewel
+ * binnen twee seconden binnen in plaats van de zes die je nu zag. */
+#define ELRS_ACQ_PROBEER_MS     600     /* per kandidaat, voor hij als mislukt geldt */
+#define ELRS_ACQ_BEVESTIG       20      /* zoveel geldige pakketten = het klopt */
+
+/* Alleen locken op pakketten die de zender ECHT op kanaal 40 uitzond.
+ *
+ * De burst-meting liet zien dat we ook naburige kanalen opvangen: zeven
+ * clusters per cyclus terwijl het sync-kanaal er maar drie kent. Die
+ * buurkanaal-pakketten valideren wel netjes, maar de zender staat dan NIET
+ * op index 0, 80 of 160 -- en dan is elke van de vier kandidaten fout.
+ *
+ * Het onderscheid is scherp:
+ *     echt op kanaal 40 : -51 tot -66 dBm, SNR +10 tot +12
+ *     buurkanaal        : -104 tot -107 dBm, SNR -4 tot -9
+ * Een drempel van +5 dB scheidt die twee zonder twijfel. */
+#define ELRS_ACQ_MIN_SNR        5
+
+/* ==========================================================================
+ *  FASE VAN DE HOP
+ * ==========================================================================
+ *  De phase-lock legt zijn referentiepunt vast op het moment dat een pakket
+ *  VERWERKT is. Bij 250 Hz is dat ~3,4 ms na het begin van dat pakket, in een
+ *  slot van 4,0 ms. De timer slaat dan 600 us later om, en dat is precies
+ *  wanneer het volgende pakket begint -- dus hoppen we midden op de preamble.
+ *
+ *    0,0 ms  pakket N begint
+ *    3,3 ms  pakket N klaar
+ *    3,4 ms  wij verwerken het, referentiepunt komt hier te liggen
+ *    4,0 ms  timer slaat om -> HOP, en hier begint pakket N+1
+ *
+ *  Met deze offset schuif je het referentiepunt op, zodat de hop eerder valt
+ *  en dus in het gat tussen twee pakketten terechtkomt. Positief = de hop
+ *  gebeurt zoveel microseconden vroeger.
+ *
+ *  BELANGRIJK: deze waarde is GEEN wachttijd, het is de TELLERSTAND waarop de
+ *  pakketten horen aan te komen. De hop valt bij het omslaan van de teller,
+ *  dus de tijd tussen "pakket verwerkt" en "hop" is 4000 - deze waarde. Een
+ *  kleine offset betekent dus juist een LATE hop.
+ *
+ *  Met 350 kwam de hop 3650 us na de verwerking, en dat is midden in het
+ *  volgende pakket. Precies dat kostte een van de vier pakketten per hop:
+ *  driekwart binnen, oftewel de 74% die gemeten werd.
+ *
+ *  We willen de hop 100 a 400 us na de verwerking, dus in het gat:
+ *      pakket op de lucht   0,0 - 3,3 ms
+ *      wij verwerken het    ongeveer 3,5 ms
+ *      HOP                  3,6 - 4,0 ms   <- hier moet hij vallen
+ *      volgend pakket       4,0 ms
+ *  Dat komt neer op een waarde van ongeveer 3600 tot 3900. */
+#define ELRS_FASE_OFFSET_US     3700
+
+/* ELRS_DEBUG_FASESWEEP = 1 : zoek de beste fase-offset automatisch.
+ *
+ *   Zodra de link staat, loopt de code de hele slotduur af in stapjes en telt
+ *   per stand hoeveel pakketten er binnenkomen. De beste stand rolt er vanzelf
+ *   uit. Handmatig getallen proberen kan ook, maar dit is een keer draaien in
+ *   plaats van tien keer flashen.
+ *
+ *   Bij 250 Hz: 4000 us in stappen van 200 = 20 standen.
+ *
+ *   De sweep stopt na een ronde en drukt de HELE tabel in een keer af, zodat
+ *   je hem niet uit de scrollback hoeft te vissen. */
+#define ELRS_DEBUG_FASESWEEP    0
+#define ELRS_FASESWEEP_STAP     200
+#define ELRS_FASESWEEP_MS       3000
+
+/* ==========================================================================
+ *  UITLIJNING VAN DE HOP-INDEX
+ * ==========================================================================
+ *  De fase bepaalt WANNEER we hoppen binnen een slot. Deze offset bepaalt
+ *  NAAR WELKE index we hoppen. Zit die er een of twee naast, dan staan we
+ *  vrijwel altijd op de verkeerde frequentie, ook al klopt de tabel en al
+ *  loopt de nonce gelijk.
+ *
+ *  Dat is een belangrijk onderscheid, want de twee fouten lijken op elkaar:
+ *
+ *    tabel fout          -> geen enkele index-offset helpt, overal ~1%
+ *    index verkeerd uitgelijnd -> een van de offsets springt eruit
+ *
+ *  ELRS_DEBUG_INDEXSWEEP loopt de offsets af en meet dat verschil. Dit is
+ *  de zwaarste knop van de twee: fout uitgelijnd kost je een factor 80,
+ *  een verkeerde fase hooguit een factor 4. Dus deze eerst. */
+#define ELRS_INDEX_OFFSET       0
+
+/* ELRS_DEBUG_INDEXSWEEP = 1 : probeer index-offset -4 tot +4, elk een paar
+ * seconden, en tel de pakketten. 9 standen van 3 s = ongeveer 27 seconden. */
+#define ELRS_DEBUG_INDEXSWEEP   0
+#define ELRS_INDEXSWEEP_VAN     (-4)
+#define ELRS_INDEXSWEEP_TOT     (4)
+#define ELRS_INDEXSWEEP_MS      3000
+
+/* ==========================================================================
+ *  UID2 EN UID3 UIT DE LUCHT TERUGREKENEN
+ * ==========================================================================
+ *  Waarom dit kan, en waarom juist deze twee bytes:
+ *
+ *  De CRC-seed gebruikt alleen UID4 en UID5:
+ *      OtaCrcInitializer = (UID4 << 8 | UID5) ^ (OTA_VERSION << 8)
+ *  De FHSS-seed gebruikt er vier:
+ *      OtaGetUidSeed()   = UID2<<24 | UID3<<16 | UID4<<8 | (UID5 ^ OTA_VERSION)
+ *
+ *  Een geldig SYNC-pakket bewijst UID4, UID5 en de OTA-versie: SYNC rekent
+ *  de CRC zonder nonce, dus daar valt niets in weg te vallen, en de payload
+ *  draagt UID4 en UID5 ook nog eens letterlijk mee. Die hebben we gezien.
+ *
+ *  UID2 en UID3 komen in de CRC HELEMAAL NIET voor. Staan die verkeerd, dan
+ *  blijft elk pakket keurig valideren, blijft de nonce netjes gelijklopen --
+ *  en is alleen de hoptabel volledig verkeerd. Precies wat we meten.
+ *
+ *  Terugrekenen kan omdat er nog maar 65536 mogelijkheden over zijn. Voor
+ *  elke kandidaat bouwen we de tabel en kijken of hij past bij wat we hebben
+ *  waargenomen. Per waarneming valt 79 van de 80 kandidaten af, dus met acht
+ *  waarnemingen blijft er er praktisch gegarandeerd precies een over.
+ *
+ *  De meting zelf: eerst op kanaal 40 vergrendelen via een echt SYNC-pakket,
+ *  zodat de absolute index vaststaat. Daarna NIET hoppen maar op een vast
+ *  ander kanaal blijven staan en noteren bij welke indexen daar een sterk
+ *  pakket binnenkomt. Op kanaal 40 zou dit niet werken: dat staat bij ELKE
+ *  denkbare seed op index 0, 80 en 160, dus daar valt niets uit af te leiden.
+ * ========================================================================== */
+#define ELRS_DEBUG_UIDZOEK      0
+
+/* ==========================================================================
+ *  KANAALPROFIEL
+ * ==========================================================================
+ *  Meet op welke kanalen de ontvanger de zender uberhaupt HOORT. Onafhankelijk
+ *  van de FHSS-tabel, de UID en de timing: de zender komt op alle 80 kanalen
+ *  even vaak, dus op elk kanaal horen ongeveer 3 sterke pakketten per seconde
+ *  binnen te komen. Zie de uitleg bij SX1280_KanaalProfiel(). */
+#define ELRS_DEBUG_KANAALPROFIEL 0
+#define ELRS_KANAALPROFIEL_STAP  4       /* elk 4e kanaal = 20 metingen */
+#define ELRS_KANAALPROFIEL_MS    3000
+
+/* ==========================================================================
+ *  TABELTEST
+ * ==========================================================================
+ *  De directe vraag: klopt de hoptabel? Gebruikt geen TIM3, geen hop en geen
+ *  vergrendeling -- alleen de radio en HAL_GetTick. Zie SX1280_TabelTest().
+ *
+ *  Kanaal 40 mag hier NIET tussen staan: dat staat bij elke denkbare tabel op
+ *  index 0, 80 en 160, dus dat geeft altijd 100% en zegt niets. */
+#define ELRS_DEBUG_TABELTEST     0
+#define ELRS_TABELTEST_KANALEN   {5, 20, 55, 70}
+#define ELRS_TABELTEST_MS        6000
+
+/* Meetkanaal. Moet NIET het sync-kanaal zijn. 76 = 2476,4 MHz, boven het
+ * drukste WiFi-verkeer. Krijg je te weinig waarnemingen, probeer dan een
+ * ander kanaal. */
+#define ELRS_UIDZOEK_KANAAL     76
+
+/* Zoveel VERSCHILLENDE indexen verzamelen voordat we gaan rekenen.
+ *
+ * Drie is niet zomaar gekozen, het is het maximum: de tabel bestaat uit drie
+ * blokken van 80 en binnen elk blok komt elk kanaal precies een keer voor.
+ * Een gegeven kanaal staat dus op exact drie van de 240 indexen, en meer
+ * verschillende waarnemingen bestaan er domweg niet.
+ *
+ * Genoeg is het ook. Nagerekend over de hele zoekruimte:
+ *     1 waarneming  -> 978 kandidaten over
+ *     2 waarnemingen ->  12 kandidaten over
+ *     3 waarnemingen ->   2 kandidaten over
+ * En die laatste twee zijn geen probleem, zie de uitleg bij de uitslag. */
+#define ELRS_UIDZOEK_WAARN      3
+
+/* Hoe lang we maximaal wachten op die waarnemingen. De zender komt ongeveer
+ * drie keer per 3,8 s op een gegeven kanaal langs. */
+#define ELRS_UIDZOEK_MS         45000
+
+/* De zoeker heeft een BEWEZEN index nodig, en die komt alleen uit een echt
+ * sync-pakket. Vergrendelen op een gegokt RC-pakket maakt de meting waardeloos,
+ * dus tijdens het zoeken zetten we die weg uit. Dit staat hier en niet bij
+ * ELRS_ACQ_VIA_RCDATA zelf, omdat ELRS_DEBUG_UIDZOEK daar nog niet bestaat. */
+#if ELRS_DEBUG_UIDZOEK
+  #undef  ELRS_ACQ_VIA_RCDATA
+  #define ELRS_ACQ_VIA_RCDATA   0
+#endif
+
+/* Aantal indexen waar het sync-kanaal staat, dus het aantal kandidaten.
+ * Het sync-kanaal staat op elke index waar i % 80 == 0:
+ *     sequence 240 -> 0, 80, 160        = DRIE kandidaten
+ *     sequence 256 -> 0, 80, 160, 240   = vier
+ * Naar boven afronden, anders mis je de laatste. */
+#define ELRS_ACQ_KANDIDATEN     ((ELRS_SEQUENCE_COUNT + ELRS_FREQ_COUNT - 1) \
+                                 / ELRS_FREQ_COUNT)
+
+/* Hoe lang zonder geldig pakket voordat de link als verloren geldt.
+ * 500 ms was te kort om iets te kunnen waarnemen. */
+/* Zolang het hoppen nog maar een paar procent oplevert, vallen er gaten van
+ * meerdere seconden tussen twee pakketten. Met 3000 ms raakte de link daardoor
+ * om de haverklap kwijt en liep het scherm vol met los- en vastkoppelen, wat
+ * het meten alleen maar in de weg zit. Ruimer zetten tot dat opgelost is. */
+#define ELRS_TIMEOUT_MS         1000
+
+/* Pakkettypes, ELRS OTA.h. LET OP: 0b11 bestaat NIET.
+ * Zie je "type 3" in de debug-uitvoer, dan is dat gegarandeerd ruis. */
+#define ELRS_PKT_RCDATA         0x00    /* 0b00 */
+#define ELRS_PKT_DATA           0x01    /* 0b01 */
+#define ELRS_PKT_SYNC           0x02    /* 0b10 */
+
+#define ELRS_PACKET_SIZE        8       /* OTA4_PACKET_SIZE */
+#define ELRS_CRC_CALC_LEN       7       /* offsetof(OTA_Packet4_s, crcLow) */
+#define ELRS_CRC14_POLY         0x2E57
+
+/* ==========================================================================
+ *  DEBUG
+ * ==========================================================================
+ * ELRS_DEBUG_SCAN = 1 : geen ontvangst, maar een RSSI-scan over alle 80
+ *   kanalen. Dit werkt ZONDER demodulatie, dus los van SF, CRC en UID. Het is
+ *   de enige test die onderscheid maakt tussen "de zender staat uit" en "mijn
+ *   instellingen kloppen niet". Zendt de T8L, dan zie je een duidelijk hoger
+ *   niveau over de hele band dan wanneer je hem uitzet. Meet altijd twee keer:
+ *   een keer met de zender aan en een keer uit, en vergelijk.
+ *
+ * ELRS_DEBUG_PHY = 1 : blijf vast op het sync-kanaal, hop niet, negeer de CRC
+ *   en dump elk pakket als hex met RSSI en SNR.
+ *
+ * Zet beide op 0 voor normale werking.
+ */
+/* ELRS_DEBUG_SEED = 1 : de beslissende test. Print niks per pakket, maar
+ *   rekent voor elk pakket TERUG welke CRC-seed het gehad moet hebben, en
+ *   houdt daar statistiek van bij.
+ *
+ *   Het idee: de seed is ((UID4 ^ OTA_VERSION) << 8) | (UID5 ^ nonce).
+ *   Alleen de lage byte varieert (met de nonce). De bovenste 6 bits zijn bij
+ *   ELKE zending van dezelfde zender identiek. Bij ruis is die waarde
+ *   willekeurig verdeeld over 64 mogelijkheden.
+ *
+ *   Springt er een waarde uit boven de achtergrond, dan (a) demoduleer je
+ *   echte pakketten en (b) lees je meteen af wat je UID4 ^ OTA_VERSION had
+ *   moeten zijn. Blijft alles vlak, dan is het ruis en klopt je SF nog niet.
+ *
+ *   Voor SYNC-pakketten is de nonce 0, dus daar valt de VOLLEDIGE seed uit te
+ *   rekenen. Twee keer dezelfde seed bij een SYNC-pakket is al bewijs: de
+ *   kans daarop bij ruis is verwaarloosbaar (1 op 16384 per paar).
+ */
+/* ELRS_DEBUG_CW = 1 : zend een ongemoduleerde draaggolf uit op een vaste
+ *   frequentie en doe verder niets. Meet die met je spectrum analyzer.
+ *
+ *   Dit meet de nauwkeurigheid van het 52 MHz kristal op je eigen print, en
+ *   dat is nu de belangrijkste openstaande vraag. Datasheet tabel 6-3 (p.37):
+ *   bij BW 800 kHz en SF5..SF11 is de TOTALE toegestane afwijking tussen
+ *   zender en ontvanger +/- 80 ppm. Op 2440 MHz is dat +/- 195 kHz.
+ *
+ *   Zit je kristal er verder naast, dan ontvang je nog wel vermogen (de RSSI
+ *   klopt, want het kanaal is 800 kHz breed) maar vergrendelt de demodulator
+ *   nooit. Precies wat je meet: sterke RSSI, SNR die op 0 blijft hangen.
+ *
+ *   Zet een antenne op de print voor je dit doet, en houd het vermogen laag.
+ */
+#define ELRS_DEBUG_CW           0
+#define ELRS_CW_FREQ_HZ         2440400000UL
+#define ELRS_CW_POWER_DBM       0
+
+/* ELRS_DEBUG_FSWEEP = 1 : meet de frequentieafwijking ZONDER meetapparatuur.
+ *
+ *   Het idee: als jouw kristal er X kHz naast zit, dan zou je precies goed
+ *   zitten als je X kHz de andere kant op afstemt. Dus verstemmen we de
+ *   ontvanger in stapjes rond het kanaal en kijken we waar de demodulator
+ *   wel aanhaakt. De SNR is daarbij de maat: bij een echte vergrendeling
+ *   springt die van 0 naar +8 of hoger.
+ *
+ *   Vind je een offset die werkt, dan heb je twee dingen tegelijk: de
+ *   diagnose EN de correctie. Die offset kan je gewoon bij elke frequentie
+ *   optellen in ELRS_FREQ_CORRECTIE_HZ hieronder.
+ *
+ *   Vind je nergens een lock, dan ligt het niet aan de frequentie en is het
+ *   tijd om naar de print zelf te kijken.
+ *
+ *   De zender moet gewoon aan staan en hoeft niets bijzonders te doen.
+ */
+/* ELRS_DEBUG_XTALSWEEP = 1 : loop de interne belastingcondensatoren van het
+ *   kristal af en meet per stand de hoogste SNR.
+ *
+ *   Datasheet 15.5 "Foot Capacitance Tuning": de SX1280 heeft INTERNE
+ *   belastingcondensatoren voor het kristal, instelbaar via registers 0xA0E
+ *   en 0xA0F. Bereik ongeveer 12 tot 27 pF, 0,5 pF per stap.
+ *
+ *   Belangrijk: het referentieontwerp (tabel 15-1) heeft GEEN externe
+ *   belastingcondensatoren bij het kristal. De datasheet zegt letterlijk dat
+ *   het ontwerp "exploits internally integrated foot capacitances". Heb jij
+ *   er zelf wel twee bijgezet, dan is de totale belasting te hoog en loopt
+ *   het kristal scheef of onrustig.
+ *
+ *   Deze sweep kan dat compenseren, en vertelt je meteen of het daaraan ligt.
+ *   Bij de juiste belasting springt de SNR omhoog.
+ */
+#define ELRS_DEBUG_XTALSWEEP    0
+#define ELRS_XTAL_DWELL_MS      8000
+#define ELRS_XTAL_TRIM          0    /* -1 = niet aanraken, 0..31 = vast */
+
+#define ELRS_DEBUG_FSWEEP       0
+#define ELRS_FSWEEP_RANGE_KHZ   800     /* van -800 tot +800 kHz */
+#define ELRS_FSWEEP_STEP_KHZ    100     /* stapgrootte; tolerantie is ~200 kHz */
+#define ELRS_FSWEEP_DWELL_MS    12000   /* per stap; genoeg voor ~7 echte pakketten */
+
+/* Vaste correctie die bij elke ingestelde frequentie wordt opgeteld.
+ * Vul hier in wat de sweep als beste offset aanwijst. */
+#define ELRS_FREQ_CORRECTIE_HZ  0
+
+/* Pakketten met minstens deze SNR worden meteen uitgeprint met hun
+ * teruggerekende seed. Dat zijn de pakketten waar de demodulator echt op
+ * vergrendeld heeft, en dus de enige die iets zeggen. Zet op 127 om uit te
+ * zetten. Bij ruis kom je nooit boven de +2 dB. */
+#define ELRS_SEED_SNR_PRINT     5
+
+#define ELRS_DEBUG_SEED         0
+#define ELRS_DEBUG_SCAN         0
+#define ELRS_DEBUG_PHY          0
+
+/* In DEBUG_PHY worden pakketten met type 0b11 en met SNR onder deze grens
+ * niet meer geprint. Een echte zender op tafel geeft SNR ver boven 0 dB;
+ * alles rond -1 dB zit in het ruisniveau. Zet op -128 om alles te zien. */
+#define ELRS_DEBUG_MIN_SNR      0
+
+/* ==========================================================================
+ *  Gedeelde toestand (gedefinieerd in sx1280include.c)
+ * ========================================================================== */
+#define ELRS_STATE_SEARCHING    0   /* wachten op sync-pakket op kanaal 40 */
+#define ELRS_STATE_LOCKED       1   /* gelockt, meehoppen                  */
+
+extern volatile uint8_t  elrs_link_state;
+extern volatile uint8_t  elrs_nonce;
+extern volatile uint8_t  elrs_do_hop;
+extern volatile uint32_t elrs_preamble_count;
+extern volatile uint32_t elrs_packet_count;
+extern volatile uint16_t elrs_channels[4];
+
+/* Staat de failsafe aan, dan zijn de kanalen GEEN stuurgegevens meer maar de
+ * veilige standen uit ELRS_FAILSAFE_*. Vraag dit dus op voordat je ze aan de
+ * motoren geeft. Bij het opstarten staat hij aan, want dan is er nog niets
+ * binnengekomen. */
+extern volatile uint8_t  elrs_failsafe;
+
+/* Linkkwaliteit in procenten, elke 3 seconden bijgewerkt. Onder de 70 wordt
+ * sturen onprettig, onder de 20 onbestuurbaar. */
+extern volatile uint8_t  elrs_lq;
+
+/* Mag je op de kanaalwaarden vertrouwen? Dit is de enige controle die je
+ * nodig hebt voordat je ze gebruikt. */
+uint8_t ELRS_LinkOK(void);
+extern volatile uint8_t  elrs_acq_poging;
+extern volatile uint8_t  elrs_acq_bevestigd;
+extern volatile uint8_t  elrs_acq_teller;
+extern volatile uint8_t  elrs_spi_bezig;
+extern volatile uint8_t  elrs_anker_nonce;
+extern volatile uint16_t elrs_anker_index;
+extern volatile uint32_t elrs_ticks;
+extern volatile uint32_t elrs_anker_ticks;
+
+/* --- Functie prototypes --- */
+uint8_t SX1280_BUSY(void);
+void    SX1280_Select(void);
+void    SX1280_Deselect(void);
+void    SX1280_getstatus(void);
+uint8_t SX1280_GetStatusByte(void);
+void    SX1280_PrintStatus(const char *label);
+void    SX1280_Reset(void);
+int8_t  SX1280_GetRssiInst(void);
+void    SX1280_GetPacketStatus(int8_t *rssi, int8_t *snr);
+
+/* Register & buffer communicatie */
+void    SX1280_WriteRegister(uint16_t address, uint8_t value);
+uint8_t SX1280_ReadRegister(uint16_t address);
+void    SX1280_ReadBuffer(uint8_t offset, uint8_t *data, uint8_t size);
+void    SX1280_WriteBufferArray(uint8_t offset, uint8_t *data, uint8_t size);
+
+/* Radio instellingen */
+void    SX1280_SetRfFrequency(uint32_t frequency);
+void    SX1280_SetRx(void);
+void    SX1280_SetDioIrqParams(void);
+void    SX1280_SetTxParams(int8_t power, uint8_t rampTime);
+void    SX1280_SetTxContinuousWave(void);
+
+/* Hoofdfuncties voor main.c */
+void    SX1280_Setup_ELRS(void);
+uint8_t SX1280_TestConnection(void);
+uint8_t SX1280_CheckRxDonePolling(void);
+void    SX1280_OnPacketReceived(void);
+
+/* Spectrum-scan: meet de piek-RSSI per kanaal over een aantal sweeps en print
+ * een staafdiagram. Werkt zonder demodulatie. */
+void    SX1280_ScanBand(uint8_t sweeps);
+
+/* Zendt een ongemoduleerde draaggolf uit en keert niet terug. Meet de
+ * frequentie met een spectrum analyzer om je kristal te controleren. */
+void    SX1280_CarrierTest(uint32_t freq_hz, int8_t power_dbm);
+
+/* Verstemt de ontvanger stapsgewijs rond het kanaal en meet per stap de
+ * hoogste SNR. Vindt zo de frequentieafwijking zonder meetapparatuur. */
+void    SX1280_FreqSweep(void);
+
+/* Meet welk kanaal de zender na het sync-kanaal gebruikt, in plaats van het
+ * uit de berekende FHSS-tabel te geloven. */
+void    SX1280_NextChannelScan(void);
+
+/* Meet op het sync-kanaal hoeveel pakketten er per bezoek binnenkomen en
+ * hoeveel tijd er tussen twee bezoeken zit. Daaruit volgt het hop-interval. */
+void    SX1280_BurstTiming(void);
+
+/* Loopt alle LoRa-pakketsnelheden van ELRS af, in beide IQ-polariteiten, en
+ * telt per stand de preambles en pakketten. Zoekt zo zelf uit op welke
+ * modulatie de zender staat. */
+void    SX1280_RateScan(void);
+
+/* Kristalbelasting: registers 0xA0E en 0xA0F, 0..31 -> 12,0 tot 27,5 pF.
+ * SX1280_XtalSweep loopt ze allemaal af en meet per stand de hoogste SNR. */
+#define SX1280_REG_XTAL_TRIM_A                  0x0A0E
+#define SX1280_REG_XTAL_TRIM_B                  0x0A0F
+void    SX1280_SetXtalTrim(uint8_t trim);
+void    SX1280_XtalSweep(void);
+
+/* Frequentiefout-indicator van de LoRa-demodulator, registers 0x954..0x956.
+ * Alleen zinvol vlak na een RxDone. Geeft de ruwe 20-bits waarde terug in
+ * *fei_ruw en een benadering in Hz als returnwaarde. */
+int32_t SX1280_GetFrequencyError(int32_t *fei_ruw);
+
+/* ELRS protocol */
+void     ELRS_InitCRC(void);
+uint16_t ELRS_CalculateCRC(uint8_t *data, uint8_t len, uint16_t seed);
+void     ELRS_UnpackChannels(uint8_t *payload, uint16_t *channels);
+
+/* Controleert de CRC tegen alle seeds uit ELRS_SEED_LIJST.
+ * Geeft 1 terug bij een match, en zet de gebruikte seed in *gebruikt. */
+uint8_t  ELRS_ValidatePacket(uint8_t *calc_buffer, uint16_t ontvangen_crc,
+                             uint16_t *gebruikt);
+
+/* ELRS_Tick() hoort in de TIM3 periode-callback. Die telt de nonce op en zet
+ * de hop-vlag. ELRS_HandleHop() roep je in de main-loop. */
+void    ELRS_Tick(void);
+void    ELRS_HandleHop(void);
+
+/* Gooit het phase-referentiepunt weg. Wordt aangeroepen bij een nieuwe lock
+ * en bij verlies van de link; het eerstvolgende geldige pakket kalibreert
+ * dan opnieuw. Zelf aanroepen hoeft niet. */
+void    ELRS_PhaseReset(void);
+
+/* Verschuift het fase-referentiepunt naar een nieuwe offset zonder opnieuw
+ * te kalibreren. Wordt door de fase-sweep gebruikt. */
+extern volatile int32_t elrs_fase_offset;
+void    ELRS_ZetFaseOffset(int32_t nieuw);
+
+/* Verschuift de hop-index. Wordt door de index-sweep gebruikt. */
+extern volatile int8_t elrs_index_offset;
+
+/* Zet het hoppen tijdelijk stil zonder opnieuw te compileren. Gebruikt door
+ * de UID-zoeker, die juist op een vast kanaal wil blijven staan. */
+extern volatile uint8_t elrs_hop_pauze;
+
+/* Staat het ankerpunt op een ECHT sync-pakket, of op een gok uit RC-data?
+ * De UID-zoeker begint pas als het anker uit een sync komt, want anders is
+ * de absolute index niet bewezen en meet je onzin. */
+extern volatile uint8_t elrs_anker_van_sync;
+
+/* UID-zoeker: terugrekenen welke UID2 en UID3 bij de gemeten hops passen.
+ * Beide worden vanuit de ontvangstlus aangeroepen. */
+void ELRS_UidZoekTick(void);
+void ELRS_UidZoekPakket(void);
+
+/* Kanaalprofiel: meet per kanaal hoeveel sterke pakketten er binnenkomen.
+ * Draait eenmalig vanuit main(), voor de gewone ontvangstlus. */
+void SX1280_KanaalProfiel(void);
+
+/* Tabeltest: controleert de hoptabel rechtstreeks tegen de zender. */
+void SX1280_TabelTest(void);
+
+/* IQ-sweep: wisselt periodiek de IQ-polariteit en houdt per stand bij hoe
+ * goed de ontvangst is. Wordt vanzelf aangeroepen vanuit de polling. */
+extern volatile uint8_t elrs_iq_actueel;
+void    ELRS_IQSweepTick(void);
+void    SX1280_SetPacketParamsIQ(uint8_t iq);
+
+#endif /* INC_SX1280INCLUDE_H_ */
