@@ -8,8 +8,7 @@
 #ifndef INC_ATTITUDE_H_
 #define INC_ATTITUDE_H_
 
-// Hoeken puur uit de accelerometer (zwaartekracht-referentie), in graden.
-// Handig om de vaste montage-offset van de IMU op te meten.
+// hoeken uit alleen de accelerometer, in graden
 void Attitude_AccelAngles(float ax, float ay, float az, float *roll, float *pitch);
 
 void Attitude_Update(float ax, float ay, float az,
@@ -17,4 +16,3 @@ void Attitude_Update(float ax, float ay, float az,
                       float dt, float *roll, float *pitch);
 
 #endif /* INC_ATTITUDE_H_ */
-

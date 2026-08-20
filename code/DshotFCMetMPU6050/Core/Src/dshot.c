@@ -33,11 +33,9 @@ extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim4;
 //beide ingesteld op 16 en dus het eerste is motor id
 //uint32_t motor_dmabuf[4][17];
-// 17 words zijn er nodig (16 bits + stopbit), maar we reserveren er 24 per motor.
-// Reden: 4*24*4 = 384 bytes = exact 12 cache-lijnen van 32 byte. Met de oude
-// 4*17*4 = 272 bytes viel het einde MIDDEN in een cache-lijn, waardoor
-// SCB_CleanDCache_by_Addr over de buffer heen ging (en dus lijnen van andere
-// variabelen meepakte). Nu valt begin en einde precies op een lijngrens.
+// we hebben er maar 17 nodig maar met 24 is het 4*24*4 = 384 bytes
+// en dat is precies 12 cachelijnen, zo pakt het cleanen van de cache
+// geen andere variabelen mee
 __attribute__((aligned(32))) uint32_t motor_dmabuf[4][24];
 
 //we hebben dshot300 en de timer van ioc was op 108MHz gezet
@@ -97,40 +95,33 @@ void update_motor_buffer(uint8_t motor_id, uint16_t throttle, uint8_t telemetry)
 }
 
 
-/* Eenmalige init, aanroepen na MX_TIM2_Init/MX_TIM4_Init en voor het armen.
- *
- * Waarom dit nodig is: na een reset staan de compare-registers (CCR) nog op een
- * willekeurige/oude waarde. De ALLEREERSTE PWM-periode na Start_DMA gebruikt die
- * waarde, waardoor de eerste puls van het eerste frame verkeerd lang is. De ESC
- * doet juist op die eerste frames zijn protocol-detectie (DShot300 herkennen).
- * Mislukt dat, dan negeert hij daarna alles - tot je opnieuw flasht en het per
- * toeval wel goed gaat. Dat verklaart het "om de keer werkt het"-gedrag.
+/* Eenmalig aanroepen na MX_TIM2_Init/MX_TIM4_Init en voor het armen.
+ * Na een reset staan de CCR's nog op een oude waarde, dan is de eerste puls
+ * te lang en herkent de ESC het protocol niet.
  */
 void dshot_init(void) {
-    // compare-registers expliciet op 0 -> lijn begint netjes laag
+    //compare registers op 0 zodat de lijn laag begint
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);
 
-    // tellers op 0 zodat beide timers vanaf hetzelfde punt starten
+    //tellers gelijk zetten
     __HAL_TIM_SET_COUNTER(&htim2, 0);
     __HAL_TIM_SET_COUNTER(&htim4, 0);
 
-    // hele buffer vullen met een geldig throttle-0 frame (incl. de padding)
+    //buffers alvast vullen met throttle 0
     for (uint8_t m = 0; m < 4; m++) {
         update_motor_buffer(m, 0, 0);
     }
 }
 
 /* 4. Het verzenden
- * Stuurt de 4 DShot-frames tegelijk uit, elk op zijn eigen timerkanaal + DMA-stream:
+ * De 4 frames gaan tegelijk uit, elk op zijn eigen kanaal + dma stream:
  *   motor_dmabuf[0] -> TIM2_CH1 (PA0,  M1)
  *   motor_dmabuf[1] -> TIM2_CH3 (PA2,  M2)
  *   motor_dmabuf[2] -> TIM4_CH2 (PD13, M3)
  *   motor_dmabuf[3] -> TIM4_CH1 (PD12, M4)
- * De frame-klaar-melding (dshot_dma_complete) komt van TIM2_CH1; alle 4 de
- * frames zijn even lang en starten samen, dus dat kanaal is de referentie.
  */
 void send_dshot() {
     //cache verversen zodat DMA de actuele buffer-inhoud leest

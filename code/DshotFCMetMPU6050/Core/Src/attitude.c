@@ -5,7 +5,6 @@
  *      Author: simon
  */
 
-// attitude.c
 #include "attitude.h"
 #include "main.h"
 #include "fc_config.h"
@@ -15,7 +14,7 @@
 
 void Attitude_AccelAngles(float ax, float ay, float az, float *roll, float *pitch)
 {
-    // hoek die de accelerometer alleen zou meten (zwaartekracht als referentie)
+    // hoek uit de zwaartekracht
     *roll  = atan2f(ay, az) * (180.0f / PI);
     *pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * (180.0f / PI);
 }
@@ -24,10 +23,10 @@ void Attitude_Update(float ax, float ay, float az,
                       float gx, float gy, float gz,
                       float dt, float *roll, float *pitch)
 {
-    float accel_roll, accel_pitch;
-    Attitude_AccelAngles(ax, ay, az, &accel_roll, &accel_pitch);
+    float a_roll, a_pitch;
+    Attitude_AccelAngles(ax, ay, az, &a_roll, &a_pitch);
 
-    // gyro (deg/s) integreren en blenden met de accel-referentie
-    *roll  = ALPHA * (*roll  + gx * dt) + (1.0f - ALPHA) * accel_roll;
-    *pitch = ALPHA * (*pitch + gy * dt) + (1.0f - ALPHA) * accel_pitch;
+    // gyro erbij optellen en mengen met de accel-hoek
+    *roll  = ALPHA * (*roll  + gx * dt) + (1.0f - ALPHA) * a_roll;
+    *pitch = ALPHA * (*pitch + gy * dt) + (1.0f - ALPHA) * a_pitch;
 }
